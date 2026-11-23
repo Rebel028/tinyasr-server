@@ -1,0 +1,138 @@
+# What runs when:
+#
+#   job      | pull request (open, sync) | push to the default branch
+#   ---------|---------------------------|------------------------------
+#   test     | yes                       | yes
+#   version  | never                     | yes (a few seconds)
+#   image    | never                     | only when the version is new
+#   release  | never                     | only when the version is new
+#
+# "The version is new" = the version in Cargo.toml has no image on ghcr.io yet.
+# To release: change the version in Cargo.toml and push. Nothing else triggers a release.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+# one run per branch at a time, so two pushes cannot release the same version twice
+concurrency:
+  group: ci-${{ github.ref }}
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal -c rustfmt,clippy && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }} # pull requests read the cache, only the default branch writes it
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - uses: actions/cache@v4
+        id: models
+        with:
+          path: models
+          key: models-${{ hashFiles('scripts/fetch-models.sh', 'Cargo.toml') }}
+      - if: steps.models.outputs.cache-hit != 'true'
+        run: sh scripts/fetch-models.sh
+      - run: cargo test --release --locked
+
+  # Decides whether this run is a release. Outputs: image, version, release (true/false).
+  version:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      image: ${{ steps.v.outputs.image }}
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          image=ghcr.io/${GITHUB_REPOSITORY,,}
+          release=false
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools inspect "$image:$version" >/dev/null 2>&1 || release=true
+          {
+            echo "image=$image"
+            echo "version=$version"
+            echo "release=$release"
+          } >> "$GITHUB_OUTPUT"
+          echo "$image:$version release=$release" >> "$GITHUB_STEP_SUMMARY"
+
+  # One native build per architecture, pushed as <version>-amd64 and <version>-arm64.
+  # No build cache: releases are rare, a cache would cost storage and expire before the next one.
+  image:
+    needs: version
+    if: needs.version.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The OCI labels (source, revision, licenses) come from the GitHub context.
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ needs.version.outputs.image }}
+          tags: type=raw,value=${{ needs.version.outputs.version }}-${{ matrix.arch }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false # keep each arch a plain image, so the release job can join them
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  # Joins the two images under <version> and latest, then tags the commit v<version>.
+  release:
+    needs: [version, test, image]
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # push the git tag
+      packages: write
+    env:
+      IMAGE: ${{ needs.version.outputs.image }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - run: docker buildx imagetools create -t "$IMAGE:$VERSION" -t "$IMAGE:latest" "$IMAGE:$VERSION-amd64" "$IMAGE:$VERSION-arm64"
+      - run: git tag "v$VERSION" && git push origin "v$VERSION"
