@@ -268,7 +268,7 @@ source = "git+https://github.com/dkaraush/tinyasr?rev=8ad81cc2a45cc5d768d2e75b0a
 
 [[package]]
 name = "tinyasr-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
  "tinyasr",
