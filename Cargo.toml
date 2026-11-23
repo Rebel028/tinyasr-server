@@ -1,6 +1,6 @@
 [package]
 name = "tinyasr-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Streaming speech-to-text server on tinyasr with a Deepgram Flux compatible websocket"
 license = "GPL-3.0-or-later"
