@@ -36,6 +36,11 @@ Common changes:
 
 Do not expose the port to a public network directly. Put a proxy with TLS and connection limits in front.
 
+## tinyasr-console - Test Web UI
+A [browser console](https://github.com/Rebel028/tinyasr-console) for tinyasr-server. It streams microphone or file audio to /v2/listen and shows the turns along with the raw event log of the websocket.
+
+<img heigt="720" alt="image" src="https://github.com/user-attachments/assets/1cb83fcc-e15c-4ffb-8020-db89859f2fd8" />
+
 ## Protocol subset
 
 ### Upgrade
