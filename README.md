@@ -138,6 +138,7 @@ Measured on an i9-10900KF (10 cores, WSL2) with beam 4 and the Russian 5 s clip 
 
 The version lives in `Cargo.toml` and the server logs it at start. To release, change it and push to the default branch. When the tests pass and `ghcr.io/<owner>/<repo>:<version>` does not exist yet, CI builds the image for linux/amd64 and linux/arm64, pushes it as `<version>` and `latest`, and tags the commit `v<version>`. A push that does not change the version releases nothing. The image labels (source, revision, version) come from the GitHub context.
 The model files and the library are pinned to one tinyasr rev, the one in `Cargo.toml`. `scripts/fetch-models.sh` reads it from there and checks the files by sha256, so a new rev with changed models fails until the sums are updated.
+Twice a month the `upstream` workflow compares that rev with upstream. When it is behind, the workflow opens a pull request with the new rev, lock file and sums, and starts the tests on it. It does not merge and does not release.
 
 ## License
 

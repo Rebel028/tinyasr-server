@@ -7,6 +7,7 @@
 #   image    | never                     | only when the version is new
 #   release  | never                     | only when the version is new
 #
+# A manual start (workflow_dispatch) runs the tests only.
 # "The version is new" = the version in Cargo.toml has no image on ghcr.io yet.
 # To release: change the version in Cargo.toml and push. Nothing else triggers a release.
 name: ci
@@ -15,6 +16,7 @@ on:
   pull_request:
   push:
     branches: [main, master]
+  workflow_dispatch: # runs the tests only; the upstream workflow starts it on its bump branch
 
 permissions:
   contents: read

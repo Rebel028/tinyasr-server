@@ -1,0 +1,114 @@
+# Looks for new upstream tinyasr commits twice a month. When the pinned rev is behind, opens a
+# pull request with the new rev, the new Cargo.lock and the new model checksums, and starts the
+# tests on it. It never merges and never releases: a person reads the pull request and decides.
+#
+# Needs the repository setting "Allow GitHub Actions to create and approve pull requests".
+name: upstream
+
+on:
+  schedule:
+    - cron: "0 6 1,15 * *" # the 1st and the 15th, 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the branch
+  pull-requests: write # open the pull request
+  actions: write # start the tests on the branch
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM: dkaraush/tinyasr
+      BASE: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare the pinned rev with upstream
+        id: rev
+        run: |
+          old=$(sed -n 's/^tinyasr = .*rev = "\([0-9a-f]\{40\}\)".*/\1/p' Cargo.toml)
+          new=$(git ls-remote "https://github.com/$UPSTREAM" HEAD | cut -f1)
+          [ -n "$old" ] && [ -n "$new" ]
+          branch=tinyasr-${new:0:8}
+          todo=true
+          if [ "$old" = "$new" ]; then
+            todo=false
+            echo "Up to date at ${old:0:8}." >> "$GITHUB_STEP_SUMMARY"
+          elif git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            todo=false
+            echo "Branch $branch already exists, nothing to do." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          {
+            echo "old=$old"
+            echo "new=$new"
+            echo "branch=$branch"
+            echo "todo=$todo"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Bump the rev, the lock file and the model checksums
+        if: steps.rev.outputs.todo == 'true'
+        id: bump
+        env:
+          OLD: ${{ steps.rev.outputs.old }}
+          NEW: ${{ steps.rev.outputs.new }}
+        run: |
+          sed -i "s/$OLD/$NEW/" Cargo.toml
+          cargo fetch # re-resolves Cargo.lock for the new rev
+          dir=$(mktemp -d)
+          for f in en-ru-uk.tzf silero_vad.onnx; do
+            curl -fsSL "https://raw.githubusercontent.com/$UPSTREAM/$NEW/models/$f.gz" | gunzip > "$dir/$f"
+          done
+          (cd "$dir" && sha256sum en-ru-uk.tzf silero_vad.onnx) > "$dir/sums"
+          python3 - "$dir/sums" <<'PY'
+          import re, sys
+          path = "scripts/fetch-models.sh"
+          script = open(path).read()
+          sums = open(sys.argv[1]).read()
+          new, n = re.subn(r"(?s)(<<SUMS\n).*?(SUMS\n)", lambda m: m.group(1) + sums + m.group(2), script)
+          assert n == 1, "no SUMS block in " + path
+          open(path, "w").write(new)
+          PY
+          if git diff --quiet scripts/fetch-models.sh; then
+            echo "models=unchanged" >> "$GITHUB_OUTPUT"
+          else
+            echo "models=CHANGED (new weights: listen to real calls before merging)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open the pull request and start the tests
+        if: steps.rev.outputs.todo == 'true'
+        env:
+          OLD: ${{ steps.rev.outputs.old }}
+          NEW: ${{ steps.rev.outputs.new }}
+          BRANCH: ${{ steps.rev.outputs.branch }}
+          MODELS: ${{ steps.bump.outputs.models }}
+        run: |
+          body=$RUNNER_TEMP/body.md
+          {
+            echo "Bumps tinyasr from \`${OLD:0:8}\` to \`${NEW:0:8}\`."
+            echo
+            echo "Model files: $MODELS"
+            echo
+            echo "Diff: https://github.com/$UPSTREAM/compare/$OLD...$NEW"
+            echo
+            echo "Upstream commits (their own text, nobody checked it):"
+            echo
+            echo '```'
+            # backticks removed so that a commit subject cannot close the code block
+            gh api "repos/$UPSTREAM/compare/$OLD...$NEW" \
+              --jq '.commits[] | "\(.sha[0:7]) \(.commit.message | split("\n")[0])"' | tr -d '`'
+            echo '```'
+            echo
+            echo "The tests run on this branch as the \`ci\` workflow (see the checks of the last commit)."
+            echo "Red tests usually mean an upstream API change that the server must follow."
+            echo "Merging does not release: for that, also change the version in Cargo.toml."
+          } > "$body"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git commit -am "Bump tinyasr to ${NEW:0:8}"
+          git push origin "$BRANCH"
+          gh pr create --base "$BASE" --head "$BRANCH" --title "Bump tinyasr to ${NEW:0:8}" --body-file "$body"
+          # a pull request opened by this token does not start workflows by itself
+          gh workflow run ci.yml --ref "$BRANCH"
