@@ -272,8 +272,14 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "tinyasr",
+ "tinylid",
  "tungstenite",
 ]
+
+[[package]]
+name = "tinylid"
+version = "0.1.0"
+source = "git+https://github.com/dkaraush/tinylid?rev=dc720ee2289ff0cbf5959a888294be1b928ac072#dc720ee2289ff0cbf5959a888294be1b928ac072"
 
 [[package]]
 name = "tungstenite"

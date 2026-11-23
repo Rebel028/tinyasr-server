@@ -57,10 +57,13 @@ jobs:
           sed -i "s/$OLD/$NEW/" Cargo.toml
           cargo fetch # re-resolves Cargo.lock for the new rev
           dir=$(mktemp -d)
-          for f in en-ru-uk.tzf silero_vad.onnx; do
+          # the files to check are the ones the script lists
+          files=$(awk '/<<SUMS/ { on = 1; next } /^SUMS/ { on = 0 } on { print $2 }' scripts/fetch-models.sh)
+          for f in $files; do
             curl -fsSL "https://raw.githubusercontent.com/$UPSTREAM/$NEW/models/$f.gz" | gunzip > "$dir/$f"
           done
-          (cd "$dir" && sha256sum en-ru-uk.tzf silero_vad.onnx) > "$dir/sums"
+          # shellcheck disable=SC2086 # the names have no spaces
+          (cd "$dir" && sha256sum $files) > "$dir/sums"
           python3 - "$dir/sums" <<'PY'
           import re, sys
           path = "scripts/fetch-models.sh"

@@ -12,15 +12,23 @@ pub struct Msg {
     pub transcript: String,
     pub conf: f32,
     pub trigger: Option<&'static str>,
+    /// The detected language code; not sent while the transcript is empty.
+    pub lang: String,
 }
 
 impl Msg {
-    pub fn json(&self, request_id: &str, seq: u64) -> String {
+    /// `hinted`: the session's `language_hint` codes as a JSON array (see `list`).
+    pub fn json(&self, request_id: &str, hinted: &str, seq: u64) -> String {
+        let langs = if self.transcript.is_empty() {
+            "[]".into()
+        } else {
+            list(&[&self.lang])
+        };
         let trigger = self
             .trigger
             .map_or(String::new(), |t| format!(",\"trigger\":\"{t}\""));
         format!(
-            "{{\"type\":\"TurnInfo\",\"request_id\":\"{request_id}\",\"sequence_id\":{seq},\"event\":\"{}\",\"turn_index\":{},\"audio_window_start\":{:.2},\"audio_window_end\":{:.2},\"transcript\":{},\"words\":[],\"end_of_turn_confidence\":{:.3}{trigger}}}",
+            "{{\"type\":\"TurnInfo\",\"request_id\":\"{request_id}\",\"sequence_id\":{seq},\"event\":\"{}\",\"turn_index\":{},\"audio_window_start\":{:.2},\"audio_window_end\":{:.2},\"transcript\":{},\"words\":[],\"languages\":{langs},\"languages_hinted\":{hinted},\"end_of_turn_confidence\":{:.3}{trigger}}}",
             self.event,
             self.turn_index,
             self.start,
@@ -40,6 +48,7 @@ impl Msg {
                 transcript: String::new(),
                 conf: 0.0,
                 trigger: None,
+                lang: self.lang.clone(),
                 ..*self
             }
         } else {
@@ -47,6 +56,7 @@ impl Msg {
                 event: "Update",
                 trigger: None,
                 transcript: self.transcript.clone(),
+                lang: self.lang.clone(),
                 ..*self
             }
         }
@@ -65,10 +75,11 @@ pub struct Turns {
     pending: Option<(f32, f64)>, // end-of-turn head said yes at a pause: (p, library s of that pause)
     last_p: f32,
     skip_commit: bool, // the turn was closed on open words: their later Commit is already reported
+    lang: String,      // the library's current language
 }
 
 impl Turns {
-    pub fn new(thr: f32, timeout_ms: u32) -> Turns {
+    pub fn new(thr: f32, timeout_ms: u32, lang: &str) -> Turns {
         Turns {
             thr,
             timeout: timeout_ms as f64 / 1000.0,
@@ -81,6 +92,7 @@ impl Turns {
             pending: None,
             last_p: 0.0,
             skip_commit: false,
+            lang: lang.into(),
         }
     }
 
@@ -131,7 +143,7 @@ impl Turns {
                     self.pending = (p >= self.thr).then_some((p, at as f64));
                 }
             }
-            Event::Language(_) => {}
+            Event::Language(l) => self.lang = l,
         }
     }
 
@@ -204,6 +216,7 @@ impl Turns {
             transcript: t.trim().to_string(),
             conf,
             trigger,
+            lang: self.lang.clone(),
         }
     }
 }
@@ -217,6 +230,11 @@ fn join(ws: &[&Word]) -> String {
         s.push_str(&w.text);
     }
     s
+}
+
+/// A JSON array of strings.
+pub fn list(v: &[&str]) -> String {
+    format!("[{}]", v.iter().map(|s| q(s)).collect::<Vec<_>>().join(","))
 }
 
 pub fn q(s: &str) -> String {
@@ -261,7 +279,7 @@ mod tests {
 
     #[test]
     fn model_end_of_turn_waits_for_the_commit() {
-        let mut t = Turns::new(0.7, 5000);
+        let mut t = Turns::new(0.7, 5000, "ru");
         let mut o = vec![];
         t.on(part(&[w("сервер", 0.2, 0.6)]), 0.8, 0.0, &mut o);
         t.on(
@@ -307,7 +325,7 @@ mod tests {
 
     #[test]
     fn low_head_and_resumed_speech_keep_the_turn() {
-        let mut t = Turns::new(0.7, 5000);
+        let mut t = Turns::new(0.7, 5000, "ru");
         let mut o = vec![];
         t.on(part(&[w("один", 0.1, 0.5)]), 0.6, 0.0, &mut o);
         t.on(Event::Eou { at: 0.8, p: 0.6 }, 0.8, 0.0, &mut o);
@@ -329,7 +347,7 @@ mod tests {
 
     #[test]
     fn timeout_on_open_words_skips_their_commit() {
-        let mut t = Turns::new(0.7, 1000);
+        let mut t = Turns::new(0.7, 1000, "ru");
         let mut o = vec![];
         t.on(part(&[w("алло", 0.1, 0.5)]), 0.6, 0.0, &mut o);
         t.tick(1.5, 0.0, &mut o);
@@ -350,10 +368,27 @@ mod tests {
             transcript: "a \"b\"".into(),
             conf: 0.75,
             trigger: Some("model"),
+            lang: "ru".into(),
         };
         assert_eq!(
-            m.json("r", 7),
-            r#"{"type":"TurnInfo","request_id":"r","sequence_id":7,"event":"EndOfTurn","turn_index":2,"audio_window_start":1.00,"audio_window_end":2.50,"transcript":"a \"b\"","words":[],"end_of_turn_confidence":0.750,"trigger":"model"}"#
+            m.json("r", &list(&["ru", "en"]), 7),
+            r#"{"type":"TurnInfo","request_id":"r","sequence_id":7,"event":"EndOfTurn","turn_index":2,"audio_window_start":1.00,"audio_window_end":2.50,"transcript":"a \"b\"","words":[],"languages":["ru"],"languages_hinted":["ru","en"],"end_of_turn_confidence":0.750,"trigger":"model"}"#
+        );
+    }
+
+    #[test]
+    fn languages_follow_the_library() {
+        let mut t = Turns::new(0.7, 5000, "ru");
+        let mut o = vec![];
+        t.on(Event::Language("uk".into()), 0.5, 0.0, &mut o);
+        t.on(part(&[w("так", 0.1, 0.4)]), 0.6, 0.0, &mut o);
+        let m = o.last().unwrap().json("r", "[]", 1);
+        assert!(m.contains(r#""languages":["uk"]"#), "{m}");
+        t.finish(1.0, 0.0, &mut o);
+        let idle = o.last().unwrap().heartbeat().json("r", "[]", 9);
+        assert!(
+            idle.contains(r#""transcript":"","words":[],"languages":[],"languages_hinted":[]"#),
+            "{idle}"
         );
     }
 }

@@ -78,7 +78,8 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "$image:$version release=$release" >> "$GITHUB_STEP_SUMMARY"
 
-  # One native build per architecture, pushed as <version>-amd64 and <version>-arm64.
+  # One native build per architecture of both images (Dockerfile targets): slim, pushed as
+  # <version>-slim-<arch>, and full, pushed as <version>-<arch>. full builds on slim's layers.
   # No build cache: releases are rare, a cache would cost storage and expire before the next one.
   image:
     needs: version
@@ -108,16 +109,25 @@ jobs:
         id: meta
         with:
           images: ${{ needs.version.outputs.image }}
-          tags: type=raw,value=${{ needs.version.outputs.version }}-${{ matrix.arch }}
       - uses: docker/build-push-action@v6
         with:
           context: .
+          target: slim
           push: true
           provenance: false # keep each arch a plain image, so the release job can join them
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ needs.version.outputs.image }}:${{ needs.version.outputs.version }}-slim-${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: full
+          push: true
+          provenance: false
+          tags: ${{ needs.version.outputs.image }}:${{ needs.version.outputs.version }}-${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
 
-  # Joins the two images under <version> and latest, then tags the commit v<version>.
+  # Joins the per-arch images: full as <version> and latest, slim as <version>-slim and slim.
+  # Then tags the commit v<version>.
   release:
     needs: [version, test, image]
     if: needs.version.outputs.release == 'true'
@@ -137,4 +147,5 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - run: docker buildx imagetools create -t "$IMAGE:$VERSION" -t "$IMAGE:latest" "$IMAGE:$VERSION-amd64" "$IMAGE:$VERSION-arm64"
+      - run: docker buildx imagetools create -t "$IMAGE:$VERSION-slim" -t "$IMAGE:slim" "$IMAGE:$VERSION-slim-amd64" "$IMAGE:$VERSION-slim-arm64"
       - run: git tag "v$VERSION" && git push origin "v$VERSION"

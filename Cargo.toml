@@ -8,6 +8,7 @@ publish = false # a server shipped as a container image; the tinyasr git depende
 
 [dependencies]
 tinyasr = { git = "https://github.com/dkaraush/tinyasr", rev = "8ad81cc2a45cc5d768d2e75b0ac126deed6d286d" }
+tinylid = { git = "https://github.com/dkaraush/tinylid", rev = "dc720ee2289ff0cbf5959a888294be1b928ac072" }
 tungstenite = "0.30"
 
 [dev-dependencies]

@@ -7,6 +7,35 @@ It targets live phone calls: 16 kHz PCM16 mono, in 40 ms frames, with one websoc
 The server has no async runtime. Each connection gets one socket thread and one session worker thread. All sessions share one loaded model.
 The socket thread reads the audio into a bounded queue and writes the messages. The worker feeds the queue into the library, so decode spikes (80 to 250 ms) never block the socket.
 
+## Quickstart
+
+Run the server (the image has every model inside and needs no network):
+
+```bash
+docker run --rm -p 8000:8000 -e TINYASR_TOKEN=change-me ghcr.io/rebel028/tinyasr-server
+curl http://localhost:8000/health   # {"status":"ok"}
+```
+
+Point a Flux client at it by changing only the base URL and the key:
+
+```
+ws://localhost:8000/v2/listen?model=flux-general-multi&encoding=linear16&sample_rate=16000&language_hint=ru
+Authorization: Token change-me
+```
+
+Send PCM16 mono audio at 16 kHz as binary frames, and read `TurnInfo` messages back. The sections below give the details.
+
+Common changes:
+
+| Want | Do |
+|---|---|
+| Another language set | `-e TINYASR_MODEL=/models/fr-de.tzf -e TINYASR_LANGS=fr` (models: `ar`, `en-es-it-pt`, `en-fa`, `en-km`, `en-ru-uk`, `fr-de`, `id-ms`, `uz`) |
+| The spoken language of each turn, also outside the model's languages | `-e TINYASR_LID=/models/tinylid.bin` |
+| A small image that fetches only the models it uses | the `slim` tag with `-v tinyasr-models:/models` (see [Build and run](#build-and-run)) |
+| No auth (local tests only) | leave `TINYASR_TOKEN` out |
+
+Do not expose the port to a public network directly. Put a proxy with TLS and connection limits in front.
+
 ## Protocol subset
 
 ### Upgrade
@@ -53,15 +82,17 @@ At connect:
 Then `TurnInfo` messages (values illustrative):
 
 ```json
-{"type":"TurnInfo","request_id":"…","sequence_id":12,"event":"StartOfTurn","turn_index":0,"audio_window_start":0.32,"audio_window_end":1.28,"transcript":"сервер","words":[],"end_of_turn_confidence":0.000}
-{"type":"TurnInfo","request_id":"…","sequence_id":13,"event":"Update","turn_index":0,"audio_window_start":0.32,"audio_window_end":1.28,"transcript":"сервер","words":[],"end_of_turn_confidence":0.000}
-{"type":"TurnInfo","request_id":"…","sequence_id":30,"event":"EndOfTurn","turn_index":0,"audio_window_start":0.32,"audio_window_end":4.36,"transcript":"Сервер базы данных упал после обновления платежей.","words":[],"end_of_turn_confidence":0.712,"trigger":"model"}
-{"type":"TurnInfo","request_id":"…","sequence_id":31,"event":"Update","turn_index":1,"audio_window_start":4.36,"audio_window_end":4.52,"transcript":"","words":[],"end_of_turn_confidence":0.000}
+{"type":"TurnInfo","request_id":"…","sequence_id":12,"event":"StartOfTurn","turn_index":0,"audio_window_start":0.32,"audio_window_end":1.28,"transcript":"сервер","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.000}
+{"type":"TurnInfo","request_id":"…","sequence_id":13,"event":"Update","turn_index":0,"audio_window_start":0.32,"audio_window_end":1.28,"transcript":"сервер","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.000}
+{"type":"TurnInfo","request_id":"…","sequence_id":30,"event":"EndOfTurn","turn_index":0,"audio_window_start":0.32,"audio_window_end":4.36,"transcript":"Сервер базы данных упал после обновления платежей.","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.712,"trigger":"model"}
+{"type":"TurnInfo","request_id":"…","sequence_id":31,"event":"Update","turn_index":1,"audio_window_start":4.36,"audio_window_end":4.52,"transcript":"","words":[],"languages":[],"languages_hinted":["ru"],"end_of_turn_confidence":0.000}
 ```
 
 - `StartOfTurn`: the first recognized word of a turn.
 - `Update`: the transcript of the open turn changed. Committed sentences are followed by the words that are not final yet.
 - `EndOfTurn`: the final transcript of the turn. `turn_index` goes up by one per turn.
+- `languages`: the language of the turn, one code. It is the language the recognizer is decoding in, or with `TINYASR_LID` on, the language tinylid hears in the `EndOfTurn`. It is `[]` while the transcript is empty.
+- `languages_hinted`: the `language_hint` codes of the session, as the server maps them (`ru-RU` becomes `ru`). It is `[]` when the client sent no hint and the server uses `TINYASR_LANGS`.
 - Heartbeat: when no other message went out for 200 ms, the server repeats the current state as an `Update`. This also happens in silence, where the transcript is empty and `turn_index` is the next turn. Clients can use the steady stream as a liveness signal.
 - If a session fails inside (a panic), the server sends `{"type":"Error","sequence_id":n,"code":"INTERNAL_SERVER_ERROR","description":"…"}` and closes with 1011. Other sessions keep running.
 
@@ -80,9 +111,10 @@ All times are seconds of the client's audio stream, dropped audio included.
 - The end of turn comes about 0.8 s after the end of speech (measured on Russian TTS). That is the head at 0.24 s plus the library's sentence freeze at 0.48 s plus the decode. With `eot_threshold` under 0.5, the library still freezes the sentence only at p > 0.5. A turn that the head scores between the threshold and 0.5 therefore ends after 3 s of silence.
 - The timeout counts audio, not wall time. If a client stops sending audio, the timeout never fires.
 - The numeric fields are JSON numbers. The vendor's schema documents `audio_window_*` and `end_of_turn_confidence` as strings, but the reference client this server was checked against parses them as numbers.
-- `EagerEndOfTurn`, `TurnResumed`, `eager_eot_threshold`, `Configure`/`ConfigureSuccess`, `ForceEndTurn`, `Warning`, `keyterm`, `numerals`, `redact` and `languages` are not implemented. Unknown query keys and text messages are ignored, not refused.
+- `EagerEndOfTurn`, `TurnResumed`, `eager_eot_threshold`, `Configure`/`ConfigureSuccess`, `ForceEndTurn`, `Warning`, `keyterm`, `numerals`, and `redact` are not implemented. Unknown query keys and text messages are ignored, not refused.
+- `languages` holds one code per turn, never several. Without `TINYASR_LID` it is the recognizer's pick among the session's languages. With `TINYASR_LID`, the `EndOfTurn` carries tinylid's top language from the first 3 s of the turn. That can be a language the model cannot transcribe, so a client that hinted `en` and gets `ru` knows the speaker is outside its hint. `StartOfTurn` and `Update` keep the recognizer's pick. Short turns (a word or two) give unreliable labels.
 - Only `linear16` at 16 kHz is supported. There are no containers, no mu-law and no other rates.
-- `model` is ignored. The served model is `TINYASR_MODEL` (en, ru, uk).
+- `model` is ignored. The served model is `TINYASR_MODEL` (by default en, ru, uk).
 - The 503 for a full server and the JSON error bodies are this server's own. The vendor's limits and bodies differ.
 - When the queue overflows (the decode falls behind by more than `TINYASR_QUEUE_MS`), the oldest audio is dropped. The amount is logged. The transcript then misses that audio, and `audio_window_*` keep the client's timeline.
 
@@ -97,6 +129,7 @@ All times are seconds of the client's audio stream, dropped audio included.
 | `TINYASR_BEAM` | `4` | Beam of the re-decode. `1` is greedy, which is cheaper and can lose punctuation. |
 | `TINYASR_TOKEN` | unset | If set, clients must send `Authorization: Token <value>`. |
 | `TINYASR_MAX_SESSIONS` | CPU count | Concurrent sessions. The next upgrade gets a 503. |
+| `TINYASR_LID` | unset | Path of `tinylid.bin`, normally `/models/tinylid.bin` (inside the full image; the slim image fetches it). If set, `languages` of each `EndOfTurn` comes from tinylid, which adds about 90 ms to the end of turn. Unset, the model is not loaded. |
 | `TINYASR_QUEUE_MS` | `3000` | Audio queue per session. When it overflows, the oldest audio is dropped. |
 
 The log goes to stderr. There is one line per session start (peer, request id, languages, thresholds) and one per session end (reason, duration, audio seconds, dropped seconds, turns). Transcripts are never logged.
@@ -108,9 +141,24 @@ The host needs only Docker:
 ```bash
 docker build -t tinyasr-server .
 docker run --rm -p 8000:8000 -e TINYASR_TOKEN=change-me tinyasr-server
-# or a released image (linux/amd64 and linux/arm64): ghcr.io/<owner>/tinyasr-server:<version>
 # client base URL: ws://<host>:8000/v2/listen
 ```
+
+There are two images, both for linux/amd64 and linux/arm64:
+
+| Image | Tags | Models | Start |
+|---|---|---|---|
+| full (the default build target) | `<version>`, `latest` | Every tinyasr model, the VAD and tinylid are inside, in `/models` (about 300 MB). | Runs the server directly. It needs no network. |
+| slim (`docker build --target slim`) | `<version>-slim`, `slim` | None inside. | First fetches the files that `TINYASR_MODEL`, `TINYASR_VAD` and `TINYASR_LID` name into `/models`, then runs the server. |
+
+The slim image fetches from the tinyasr repository at the rev this server was built against, and checks each file by sha256. A file that is already in `/models` with the right checksum is not fetched again. Mount a volume there, and only the first start needs the network:
+
+```bash
+docker run --rm -p 8000:8000 -v tinyasr-models:/models ghcr.io/<owner>/tinyasr-server:slim
+```
+
+To serve another model, set `TINYASR_MODEL` and `TINYASR_LANGS` together, for example `-e TINYASR_MODEL=/models/fr-de.tzf -e TINYASR_LANGS=fr`. This works in both images. The models are `ar`, `en-es-it-pt`, `en-fa`, `en-km`, `en-ru-uk`, `fr-de`, `id-ms` and `uz`.
+A model file of your own also works in the slim image: put it into the mounted `/models` under a name that is not in that list. The image uses it without a checksum check.
 
 `--build-arg RUSTFLAGS="-C target-cpu=native"` gives 7 to 10 percent, but the image then runs only on CPUs like the build host.
 

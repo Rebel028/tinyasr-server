@@ -1,5 +1,5 @@
 //! Integration tests: start the server binary, talk the Flux subset to it over real sockets.
-//! Needs models/en-ru-uk.tzf and models/silero_vad.onnx (see README) and tests/data/ru5.s16.
+//! Needs models/en-ru-uk.tzf, models/silero_vad.onnx and models/tinylid.bin (see README) and tests/data/ru5.s16.
 //! FLUX_CONCURRENT=<n> sets the number of sessions in `concurrent_sessions` (default 4).
 
 use serde_json::Value;
@@ -236,6 +236,13 @@ fn turns_heartbeats_and_close() {
 
     assert_eq!(log.msgs[0].1["type"], "Connected");
     let lat: Vec<Duration> = (0..2).map(|i| check_turn(&log, i)).collect();
+    for (_, m) in log.turns("EndOfTurn") {
+        assert_eq!(
+            (&m["languages"], &m["languages_hinted"]),
+            (&serde_json::json!(["ru"]), &serde_json::json!(["ru"])),
+            "{m}"
+        );
+    }
 
     // Updates of the first turn carry growing text
     let ups: Vec<usize> = log
@@ -266,7 +273,8 @@ fn turns_heartbeats_and_close() {
         idle.len() >= 8
             && idle.iter().all(|m| m.1["event"] == "Update"
                 && m.1["turn_index"] == 1
-                && text(&m.1).is_empty()),
+                && text(&m.1).is_empty()
+                && m.1["languages"] == serde_json::json!([])),
         "idle: {} messages",
         idle.len()
     );
@@ -392,4 +400,31 @@ fn concurrent_sessions() {
         "concurrent n={n}: end-of-turn after speech end mean {lat_mean:?} max {lat_max:?}; max message gap {gap:?}"
     );
     assert!(gap <= Duration::from_millis(250), "max gap {gap:?}");
+}
+
+#[test]
+fn lid_names_a_language_outside_the_hint() {
+    let srv = start(&[("TINYASR_LID", "models/tinylid.bin")]);
+    let mut ws = connect(
+        srv.port,
+        &Q.replace("language_hint=ru", "language_hint=en"),
+        None,
+    )
+    .unwrap();
+    let mut log = Log::default();
+    log.turn(&mut ws, &clip(), 4.0);
+    log.close(&mut ws);
+    let eot = log.turns("EndOfTurn");
+    assert!(!eot.is_empty(), "no EndOfTurn");
+    for (_, m) in &eot {
+        assert_eq!(
+            (&m["languages"], &m["languages_hinted"]),
+            (&serde_json::json!(["ru"]), &serde_json::json!(["en"])),
+            "{m}"
+        );
+    }
+    eprintln!(
+        "lid: end-of-turn after speech end {:?}",
+        eot[0].0 - log.speech_end[0]
+    );
 }

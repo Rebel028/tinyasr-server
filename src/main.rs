@@ -14,16 +14,21 @@ use std::time::{Duration, Instant};
 use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::protocol::{CloseFrame, Role};
 use tungstenite::{Error as WsError, Message, WebSocket};
-use turns::{Msg, Turns, q};
+use turns::{Msg, Turns, list, q};
 
 const SR: usize = 16000;
 /// An `Update` goes out when nothing else did for this long (clients read the steady stream as liveness).
 const HEARTBEAT: Duration = Duration::from_millis(200);
 /// Socket read timeout: how often the socket thread looks at outgoing messages.
 const POLL: Duration = Duration::from_millis(10);
+/// Recent audio kept for tinylid (it reads at most 30 s).
+const LID_KEEP: usize = 30 * SR;
+/// The start of a turn given to tinylid: it costs ~30 ms per second of audio (i9-10900KF), so 3 s keep it under 100 ms.
+const LID_MAX: usize = 3 * SR;
 
 struct Cfg {
     models: tinyasr::Models,
+    lid: Option<tinylid::Model>, // TINYASR_LID: the language of each EndOfTurn from its audio
     langs: Vec<String>,
     beam: usize,
     token: Option<String>,
@@ -35,6 +40,7 @@ struct Cfg {
 
 struct Params {
     langs: Vec<String>,
+    hints: Vec<String>, // as the client sent them; empty when `langs` is the default
     thr: f32,
     timeout_ms: u32,
 }
@@ -69,6 +75,11 @@ fn main() {
     })
     .expect("load models");
     drop((asr, vad));
+    let lid_path = std::env::var("TINYASR_LID").ok().filter(|p| !p.is_empty());
+    let lid = lid_path.as_ref().map(|p| {
+        tinylid::Model::from_bytes(&std::fs::read(p).expect("read TINYASR_LID"))
+            .expect("load TINYASR_LID")
+    });
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let langs: Vec<String> = env("TINYASR_LANGS", "ru")
         .split(',')
@@ -82,6 +93,7 @@ fn main() {
         );
     }
     let cfg = Arc::new(Cfg {
+        lid,
         langs,
         beam: num("TINYASR_BEAM", tinyasr::DEFAULT_BEAM),
         token: std::env::var("TINYASR_TOKEN")
@@ -96,7 +108,7 @@ fn main() {
     let port = env("PORT", "8000");
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).expect("bind PORT");
     eprintln!(
-        "tinyasr-server {} listening on :{port}, models loaded in {} ms, model langs {:?}, default langs {:?}, beam {}, max sessions {}, queue {} ms, auth {}",
+        "tinyasr-server {} listening on :{port}, models loaded in {} ms, model langs {:?}, default langs {:?}, beam {}, max sessions {}, queue {} ms, auth {}, lid {}",
         env!("CARGO_PKG_VERSION"),
         t0.elapsed().as_millis(),
         cfg.models.langs(),
@@ -104,7 +116,8 @@ fn main() {
         cfg.beam,
         cfg.max,
         cfg.queue * 1000 / SR,
-        if cfg.token.is_some() { "token" } else { "off" }
+        if cfg.token.is_some() { "token" } else { "off" },
+        lid_path.as_deref().unwrap_or("off")
     );
     for s in listener.incoming().flatten() {
         let cfg = cfg.clone();
@@ -240,11 +253,13 @@ fn params(cfg: &Cfg, req: &Req) -> Result<Params, String> {
     if rate.is_some_and(|r| r != "16000") {
         return Err("Only sample_rate=16000 is supported.".into());
     }
+    let hints = langs.clone();
     if langs.is_empty() {
         langs = cfg.langs.clone();
     }
     Ok(Params {
         langs,
+        hints,
         thr,
         timeout_ms,
     })
@@ -261,6 +276,7 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
     );
     let _ = s.set_read_timeout(Some(POLL));
     let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+    let hinted = list(&p.hints.iter().map(String::as_str).collect::<Vec<_>>());
     let mut ws = WebSocket::from_partially_read(s, rest, Role::Server, None);
     let audio = Arc::new(Audio::new(cfg.queue));
     let pos = Arc::new(AtomicU64::new(0)); // stream samples the worker has processed
@@ -288,6 +304,7 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
         transcript: String::new(),
         conf: 0.0,
         trigger: None,
+        lang: String::new(),
     };
     let mut last = Instant::now();
     let mut odd = None;
@@ -318,7 +335,7 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
             loop {
                 match rx.try_recv() {
                     Ok(m) => {
-                        ok &= ws.send(Message::text(m.json(rid, seq))).is_ok();
+                        ok &= ws.send(Message::text(m.json(rid, &hinted, seq))).is_ok();
                         seq += 1;
                         hb = m.heartbeat();
                         last = Instant::now();
@@ -360,7 +377,7 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
             }
             if closing.is_none() && ok && last.elapsed() >= HEARTBEAT {
                 hb.end = pos.load(Ordering::Relaxed) as f64 / SR as f64;
-                ok &= ws.send(Message::text(hb.json(rid, seq))).is_ok();
+                ok &= ws.send(Message::text(hb.json(rid, &hinted, seq))).is_ok();
                 seq += 1;
                 last = Instant::now();
             }
@@ -401,12 +418,17 @@ fn work(cfg: &Cfg, p: &Params, audio: &Audio, pos: &AtomicU64, tx: &mpsc::Sender
             ..Default::default()
         },
     );
-    let mut t = Turns::new(p.thr, p.timeout_ms);
+    let mut t = Turns::new(p.thr, p.timeout_ms, s.lang());
     let (mut lib, mut out) = (0usize, vec![]);
+    let mut recent: VecDeque<f32> = VecDeque::new(); // the last LID_KEEP library samples, only with tinylid on
     loop {
         let (evs, off, fin) = match audio.pop() {
             Pop::Audio(c, off) => {
                 lib += c.len();
+                if cfg.lid.is_some() {
+                    recent.extend(&c);
+                    recent.drain(..recent.len().saturating_sub(LID_KEEP));
+                }
                 (s.push(&c), off, false)
             }
             Pop::Finish(off) => (s.finish(), off, true),
@@ -422,6 +444,17 @@ fn work(cfg: &Cfg, p: &Params, audio: &Audio, pos: &AtomicU64, tx: &mpsc::Sender
             t.tick(ps, os, &mut out);
         }
         pos.store(lib as u64 + off, Ordering::Relaxed);
+        if let Some(lid) = &cfg.lid {
+            for m in out.iter_mut().filter(|m| m.event == "EndOfTurn") {
+                // the turn start in library samples (drops inside the turn make this a little early)
+                let from = ((m.start - os) * SR as f64).max(0.0) as usize;
+                let skip = recent.len().saturating_sub(lib.saturating_sub(from));
+                let x: Vec<f32> = recent.iter().skip(skip).take(LID_MAX).copied().collect();
+                if let Some((code, _)) = lid.top(&lid.predict(&x, tinylid::Mode::Fast), 1).first() {
+                    m.lang = code.to_string();
+                }
+            }
+        }
         for m in out.drain(..) {
             if tx.send(m).is_err() {
                 return t.count();
