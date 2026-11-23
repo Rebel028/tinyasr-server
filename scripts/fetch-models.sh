@@ -40,7 +40,12 @@ for f; do
     echo "$f: present"
     continue
   fi
-  curl -fsSL "https://raw.githubusercontent.com/dkaraush/tinyasr/$REV/models/$f.gz" | gunzip > "$f.part" \
+  echo "$f: downloading"
+  rm -f "$f.gz"
+  # curl redraws its meter with \r; turn that into lines so docker logs show progress live
+  { curl -fL -o "$f.gz" "https://raw.githubusercontent.com/dkaraush/tinyasr/$REV/models/$f.gz" 2>&1 || rm -f "$f.gz"; } \
+    | stdbuf -o0 tr '\r' '\n' >&2
+  { [ -f "$f.gz" ] && gunzip -c "$f.gz" > "$f.part" && rm "$f.gz"; } \
     || { echo "$f: download failed (the first start with a new file needs the network)" >&2; exit 1; }
   echo "$sum  $f.part" | sha256sum -c - >/dev/null || { echo "$f: checksum mismatch" >&2; exit 1; }
   mv "$f.part" "$f"
