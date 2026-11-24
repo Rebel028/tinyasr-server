@@ -7,6 +7,8 @@ ARG RUSTFLAGS=""
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# the start-up self-test clip, embedded into the binary
+COPY tests/data/ru5.s16 ./tests/data/
 RUN RUSTFLAGS="${RUSTFLAGS}" cargo build --release --locked
 
 FROM debian:bookworm-slim AS slim

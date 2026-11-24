@@ -17,14 +17,18 @@ use tungstenite::{Error as WsError, Message, WebSocket};
 use turns::{Msg, Turns, list, q};
 
 const SR: usize = 16000;
-/// An `Update` goes out when nothing else did for this long (clients read the steady stream as liveness).
-const HEARTBEAT: Duration = Duration::from_millis(200);
+/// An `Update` goes out when the worker processed this much audio (0.2 s) since the last message: as Flux, by audio,
+/// so a stalled decoder goes quiet. 0.2 s, not Flux's ~0.25 s: with 40 ms frames that would leave 280 ms gaps.
+const HEARTBEAT: u64 = SR as u64 / 5;
 /// Socket read timeout: how often the socket thread looks at outgoing messages.
 const POLL: Duration = Duration::from_millis(10);
 /// Recent audio kept for tinylid (it reads at most 30 s).
 const LID_KEEP: usize = 30 * SR;
 /// The start of a turn given to tinylid: it costs ~30 ms per second of audio (i9-10900KF), so 3 s keep it under 100 ms.
 const LID_MAX: usize = 3 * SR;
+/// The start-up self-test clip (5 s of Russian, the integration tests' clip) and its text.
+const CLIP: &[u8] = include_bytes!("../tests/data/ru5.s16");
+const CLIP_TEXT: &str = "сервер базы данных упал после обновления платежей";
 
 struct Cfg {
     models: tinyasr::Models,
@@ -33,7 +37,9 @@ struct Cfg {
     beam: usize,
     token: Option<String>,
     max: usize,
-    queue: usize, // samples
+    queue: usize,               // samples
+    trace: bool,                // TINYASR_TRACE=1: one timing line per second per session
+    health: Result<(), String>, // the start-up self-test; Err holds the reason
     active: AtomicUsize,
     ids: AtomicU64,
 }
@@ -43,6 +49,9 @@ struct Params {
     hints: Vec<String>, // as the client sent them; empty when `langs` is the default
     thr: f32,
     timeout_ms: u32,
+    eager: Option<f32>,
+    enc: &'static str, // linear16, mulaw or alaw
+    rate: usize,
 }
 
 fn env(k: &str, d: &str) -> String {
@@ -92,7 +101,7 @@ fn main() {
             models.langs()
         );
     }
-    let cfg = Arc::new(Cfg {
+    let mut cfg = Cfg {
         lid,
         langs,
         beam: num("TINYASR_BEAM", tinyasr::DEFAULT_BEAM),
@@ -101,16 +110,22 @@ fn main() {
             .filter(|t| !t.is_empty()),
         max: num("TINYASR_MAX_SESSIONS", cores),
         queue: num("TINYASR_QUEUE_MS", 3000usize) * SR / 1000,
+        trace: env("TINYASR_TRACE", "0") == "1",
+        health: Ok(()),
         active: AtomicUsize::new(0),
         ids: AtomicU64::new(1),
         models,
-    });
+    };
+    let loaded = t0.elapsed();
+    // before the bind: /health cannot answer before the result is known
+    cfg.health = self_test(&cfg);
+    let cfg = Arc::new(cfg);
     let port = env("PORT", "8000");
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).expect("bind PORT");
     eprintln!(
         "tinyasr-server {} listening on :{port}, models loaded in {} ms, model langs {:?}, default langs {:?}, beam {}, max sessions {}, queue {} ms, auth {}, lid {}",
         env!("CARGO_PKG_VERSION"),
-        t0.elapsed().as_millis(),
+        loaded.as_millis(),
         cfg.models.langs(),
         cfg.langs,
         cfg.beam,
@@ -135,7 +150,14 @@ fn conn(cfg: Arc<Cfg>, mut s: TcpStream) {
         return err(&mut s, 400, "BAD_REQUEST", "Malformed request.");
     };
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/health") => http(&mut s, 200, "{\"status\":\"ok\"}"),
+        ("GET", "/health") => match &cfg.health {
+            Ok(()) => http(&mut s, 200, "{\"status\":\"ok\"}"),
+            Err(r) => http(
+                &mut s,
+                503,
+                &format!("{{\"status\":\"self-test failed\",\"reason\":{}}}", q(r)),
+            ),
+        },
         ("GET", "/v2/listen") => listen(cfg, s, &req, rest),
         _ => err(&mut s, 404, "NOT_FOUND", "Not found."),
     }
@@ -203,8 +225,8 @@ fn listen(cfg: Arc<Cfg>, mut s: TcpStream, req: &Req, rest: Vec<u8>) {
 }
 
 fn params(cfg: &Cfg, req: &Req) -> Result<Params, String> {
-    let (mut enc, mut rate, mut langs, mut thr, mut timeout_ms) =
-        (None, None, vec![], 0.7f32, 5000u32);
+    let (mut enc, mut rate, mut langs, mut thr, mut timeout_ms, mut eager) =
+        (None, None, vec![], 0.7f32, 5000u32, None);
     let mine = cfg.models.langs();
     for (k, v) in &req.query {
         match k.as_str() {
@@ -244,14 +266,32 @@ fn params(cfg: &Cfg, req: &Req) -> Result<Params, String> {
                     .filter(|t| (100..=60000).contains(t))
                     .ok_or("eot_timeout_ms must be an integer from 100 to 60000.")?
             }
+            "eager_eot_threshold" => {
+                eager = Some(
+                    v.parse()
+                        .ok()
+                        .filter(|t| (0.3..=0.9).contains(t))
+                        .ok_or("eager_eot_threshold must be a number from 0.3 to 0.9.")?,
+                )
+            }
             _ => {} // model, keyterm, numerals and the rest: accepted and ignored
         }
     }
-    if enc != Some("linear16") {
-        return Err("Only encoding=linear16 (PCM16 little-endian, mono) is supported.".into());
-    }
-    if rate.is_some_and(|r| r != "16000") {
-        return Err("Only sample_rate=16000 is supported.".into());
+    let enc = match enc {
+        Some("linear16") => "linear16",
+        Some("mulaw") => "mulaw",
+        Some("alaw") => "alaw",
+        _ => return Err("Supported: encoding=linear16 (PCM16 little-endian), mulaw or alaw, mono, no container.".into()),
+    };
+    let rate = match rate.unwrap_or("16000") {
+        "8000" => 8000,
+        "16000" => 16000,
+        "24000" => 24000,
+        "48000" => 48000,
+        _ => return Err("Supported: sample_rate=8000, 16000, 24000 or 48000.".into()),
+    };
+    if eager.is_some_and(|e| e > thr) {
+        return Err("eager_eot_threshold must not be greater than eot_threshold.".into());
     }
     let hints = langs.clone();
     if langs.is_empty() {
@@ -262,6 +302,9 @@ fn params(cfg: &Cfg, req: &Req) -> Result<Params, String> {
         hints,
         thr,
         timeout_ms,
+        eager,
+        enc,
+        rate,
     })
 }
 
@@ -280,12 +323,14 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
     let mut ws = WebSocket::from_partially_read(s, rest, Role::Server, None);
     let audio = Arc::new(Audio::new(cfg.queue));
     let pos = Arc::new(AtomicU64::new(0)); // stream samples the worker has processed
+    let sent = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]); // messages, bytes; counted only with trace on
     let (tx, rx) = mpsc::channel::<Msg>();
+    let mut input = Input::new(p.enc, p.rate);
     let worker = {
-        let (cfg, audio, pos) = (cfg.clone(), audio.clone(), pos.clone());
+        let (cfg, audio, pos, sent) = (cfg.clone(), audio.clone(), pos.clone(), sent.clone());
         std::thread::Builder::new()
             .name(format!("session-{id}"))
-            .spawn(move || work(&cfg, &p, &audio, &pos, &tx))
+            .spawn(move || work(&cfg, &p, &audio, &pos, &tx, &sent))
     };
     let Ok(worker) = worker else { return };
     let mut worker = Some(worker);
@@ -305,13 +350,19 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
         conf: 0.0,
         trigger: None,
         lang: String::new(),
+        silence: None,
     };
-    let mut last = Instant::now();
-    let mut odd = None;
+    let mut beat = 0u64; // pos when the last message went out
+    // (lag, dropped) in ms, and pos
+    let stamp = || {
+        let ((got, dropped), p) = (audio.stats(), pos.load(Ordering::Relaxed));
+        let ms = |v: u64| v * 1000 / SR as u64;
+        (ms(got.saturating_sub(p)), ms(dropped), p)
+    };
     let mut closing: Option<Instant> = None;
     while ok {
         match ws.read() {
-            Ok(Message::Binary(b)) => audio.push(pcm(&b, &mut odd)),
+            Ok(Message::Binary(b)) => audio.push(input.push(&b)),
             Ok(Message::Text(t)) => {
                 if msg_type(&t) == Some("CloseStream") {
                     audio.set(State::Finish);
@@ -335,10 +386,16 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
             loop {
                 match rx.try_recv() {
                     Ok(m) => {
-                        ok &= ws.send(Message::text(m.json(rid, &hinted, seq))).is_ok();
+                        let (lag, dropped, p) = stamp();
+                        let j = m.json(rid, &hinted, seq, lag, dropped);
+                        if cfg.trace {
+                            sent[0].fetch_add(1, Ordering::Relaxed);
+                            sent[1].fetch_add(j.len() as u64, Ordering::Relaxed);
+                        }
+                        ok &= ws.send(Message::text(j)).is_ok();
                         seq += 1;
                         hb = m.heartbeat();
-                        last = Instant::now();
+                        beat = p;
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
@@ -375,11 +432,17 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
                     }
                 }
             }
-            if closing.is_none() && ok && last.elapsed() >= HEARTBEAT {
-                hb.end = pos.load(Ordering::Relaxed) as f64 / SR as f64;
-                ok &= ws.send(Message::text(hb.json(rid, &hinted, seq))).is_ok();
+            let (lag, dropped, p) = stamp();
+            if closing.is_none() && ok && p >= beat + HEARTBEAT {
+                hb.end = p as f64 / SR as f64;
+                let j = hb.json(rid, &hinted, seq, lag, dropped);
+                if cfg.trace {
+                    sent[0].fetch_add(1, Ordering::Relaxed);
+                    sent[1].fetch_add(j.len() as u64, Ordering::Relaxed);
+                }
+                ok &= ws.send(Message::text(j)).is_ok();
                 seq += 1;
-                last = Instant::now();
+                beat = p;
             }
         }
         if ok && ws.flush().is_err() && closing.is_none() {
@@ -408,7 +471,14 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
 }
 
 /// The session worker: audio from the queue into the library, turn messages out. Returns the number of turns ended.
-fn work(cfg: &Cfg, p: &Params, audio: &Audio, pos: &AtomicU64, tx: &mpsc::Sender<Msg>) -> u32 {
+fn work(
+    cfg: &Cfg,
+    p: &Params,
+    audio: &Audio,
+    pos: &AtomicU64,
+    tx: &mpsc::Sender<Msg>,
+    sent: &[AtomicU64; 2],
+) -> u32 {
     let codes: Vec<&str> = p.langs.iter().map(String::as_str).collect();
     let mut s = tinyasr::Session::new(
         &cfg.models,
@@ -419,23 +489,48 @@ fn work(cfg: &Cfg, p: &Params, audio: &Audio, pos: &AtomicU64, tx: &mpsc::Sender
         },
     );
     let mut t = Turns::new(p.thr, p.timeout_ms, s.lang());
+    t.eager = p.eager;
     let (mut lib, mut out) = (0usize, vec![]);
     let mut recent: VecDeque<f32> = VecDeque::new(); // the last LID_KEEP library samples, only with tinylid on
+    let mut stall = std::env::var("TINYASR_TEST_STALL_MS") // tests only: one sleep after 1 s of audio
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis);
+    // trace: push count, push time sum and max this second; open sentence words and its start (library samples); turn chars
+    let (t0, mut tlog) = (Instant::now(), Instant::now());
+    let (mut pn, mut psum, mut pmax) = (0u32, Duration::ZERO, Duration::ZERO);
+    let (mut open_w, mut open_at, mut turn_c) = (0usize, 0usize, 0usize);
     loop {
         let (evs, off, fin) = match audio.pop() {
             Pop::Audio(c, off) => {
                 lib += c.len();
+                if let Some(d) = stall.take_if(|_| lib >= SR) {
+                    std::thread::sleep(d);
+                }
                 if cfg.lid.is_some() {
                     recent.extend(&c);
                     recent.drain(..recent.len().saturating_sub(LID_KEEP));
                 }
-                (s.push(&c), off, false)
+                let t1 = cfg.trace.then(Instant::now);
+                let evs = s.push(&c);
+                if let Some(t1) = t1 {
+                    let d = t1.elapsed();
+                    (pn, psum, pmax) = (pn + 1, psum + d, pmax.max(d));
+                }
+                (evs, off, false)
             }
             Pop::Finish(off) => (s.finish(), off, true),
             Pop::Abort => return t.count(),
         };
         let (ps, os) = (lib as f64 / SR as f64, off as f64 / SR as f64);
         for e in evs {
+            if cfg.trace {
+                match &e {
+                    tinyasr::Event::Partial { open, tail } => open_w = open.len() + tail.len(),
+                    tinyasr::Event::Commit(_) => (open_w, open_at) = (0, lib),
+                    _ => {}
+                }
+            }
             t.on(e, ps, os, &mut out);
         }
         if fin {
@@ -455,6 +550,45 @@ fn work(cfg: &Cfg, p: &Params, audio: &Audio, pos: &AtomicU64, tx: &mpsc::Sender
                 }
             }
         }
+        if cfg.trace {
+            if let Some(m) = out.last() {
+                turn_c = if m.event == "EndOfTurn" {
+                    0
+                } else {
+                    m.transcript.chars().count()
+                };
+            }
+            if tlog.elapsed() >= Duration::from_secs(1) {
+                let (recv, queued, dropped) = {
+                    let q = audio.lock();
+                    (q.received, q.len, q.dropped)
+                };
+                // statm field 2: resident pages; 4 KiB pages assumed
+                let rss = std::fs::read_to_string("/proc/self/statm")
+                    .ok()
+                    .and_then(|m| m.split_whitespace().nth(1)?.parse::<u64>().ok())
+                    .map_or(-1.0, |p| (p * 4096) as f64 / 1048576.0);
+                let secs = |v: usize| v as f64 / SR as f64;
+                eprintln!(
+                    "{} trace t_s={:.1} push_n={pn} push_ms={:.1} push_max_ms={:.1} proc_s={:.2} recv_s={:.2} queue_s={:.2} dropped_s={:.2} open_words={open_w} open_s={:.2} turn_chars={turn_c} msgs={} msg_bytes={} rss_mb={rss:.1}",
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("session-?")
+                        .replace('-', " "),
+                    t0.elapsed().as_secs_f64(),
+                    psum.as_secs_f64() * 1e3,
+                    pmax.as_secs_f64() * 1e3,
+                    (lib as u64 + off) as f64 / SR as f64,
+                    recv as f64 / SR as f64,
+                    secs(queued),
+                    dropped as f64 / SR as f64,
+                    secs(lib - open_at),
+                    sent[0].swap(0, Ordering::Relaxed),
+                    sent[1].swap(0, Ordering::Relaxed),
+                );
+                (tlog, pn, psum, pmax) = (Instant::now(), 0, Duration::ZERO, Duration::ZERO);
+            }
+        }
         for m in out.drain(..) {
             if tx.send(m).is_err() {
                 return t.count();
@@ -464,6 +598,81 @@ fn work(cfg: &Cfg, p: &Params, audio: &Audio, pos: &AtomicU64, tx: &mpsc::Sender
             return t.count();
         }
     }
+}
+
+/// The bundled clip once through a session worker, in 40 ms frames as a client sends it. Logs the result.
+fn self_test(cfg: &Cfg) -> Result<(), String> {
+    // shortcut: the clip is Russian, so a model without ru only proves that the decode runs; add a clip per language when those models need a text check.
+    let ru = cfg.models.langs().contains(&"ru");
+    let p = Params {
+        langs: if ru {
+            vec!["ru".into()]
+        } else {
+            cfg.langs.clone()
+        },
+        hints: vec![],
+        thr: 0.7,
+        timeout_ms: 5000,
+        eager: None,
+        enc: "linear16",
+        rate: SR,
+    };
+    let audio = Audio::new(usize::MAX);
+    let mut input = Input::new(p.enc, p.rate);
+    for f in CLIP.chunks(1280) {
+        audio.push(input.push(f));
+    }
+    audio.set(State::Finish);
+    let (tx, rx) = mpsc::channel();
+    let t0 = Instant::now();
+    let done = std::thread::scope(|s| {
+        s.spawn(|| {
+            work(
+                cfg,
+                &p,
+                &audio,
+                &AtomicU64::new(0),
+                &tx,
+                &Default::default(),
+            )
+        })
+        .join()
+    });
+    let ms = t0.elapsed().as_millis();
+    let got = rx
+        .try_iter()
+        .filter(|m| m.event == "EndOfTurn")
+        .map(|m| m.transcript)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let want = env("TINYASR_TEST_SELFTEST_TEXT", CLIP_TEXT); // tests only: a wrong text fails the self-test
+    let r = match done {
+        Err(_) => Err("the decode failed".to_string()),
+        Ok(_) if !ru => {
+            eprintln!(
+                "self-test: transcript check skipped, the model has no ru for the Russian clip"
+            );
+            Ok(())
+        }
+        Ok(_) if words(&got) == words(&want) => Ok(()),
+        Ok(_) => Err(format!("transcript {got:?}, expected {want:?}")),
+    };
+    eprintln!(
+        "self-test {} in {ms} ms, transcript {got:?}",
+        r.as_ref()
+            .map_or_else(|e| format!("FAILED ({e})"), |_| "ok".into())
+    );
+    r
+}
+
+/// Lowercase words without punctuation, ё as е: the comparison of tests/flux.rs.
+fn words(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .replace('ё', "е")
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -564,17 +773,118 @@ impl Audio {
     }
 }
 
-/// PCM16 LE to f32; an odd byte waits for the next frame.
-fn pcm(b: &[u8], odd: &mut Option<u8>) -> Vec<f32> {
-    let mut bytes: Vec<u8> = odd.take().into_iter().chain(b.iter().copied()).collect();
-    if bytes.len() % 2 == 1 {
-        *odd = bytes.pop();
+/// A session's binary frames (linear16, mu-law or A-law at 8, 16, 24 or 48 kHz) as 16 kHz samples.
+/// Resampling: up by `l`, a Blackman-windowed sinc low-pass at `rate * l`, down by `m`, as one polyphase FIR.
+struct Input {
+    enc: &'static str,
+    odd: Option<u8>, // a linear16 byte that waits for the next frame
+    l: usize,
+    m: usize,
+    h: Vec<f32>,
+    x: Vec<f32>, // input samples still under the filter
+    t: usize,    // the next output, at `rate * l`, counted from x[0]
+}
+
+impl Input {
+    fn new(enc: &'static str, rate: usize) -> Input {
+        let (l, m) = match rate {
+            8000 => (2, 1),
+            24000 => (2, 3),
+            48000 => (1, 3),
+            _ => (1, 1),
+        };
+        let h = if l * m == 1 {
+            vec![1.0]
+        } else {
+            use std::f64::consts::PI;
+            let r = (rate * l) as f64;
+            // Blackman: transition 6 / n of the rate, here 1 kHz, from 500 Hz below to the lower Nyquist
+            let n = (6.0 * r / 1000.0) as usize + 1;
+            let fc = ((rate.min(SR) / 2) as f64 - 500.0) / r;
+            let c = (n - 1) as f64 / 2.0;
+            let h: Vec<f64> = (0..n)
+                .map(|i| {
+                    let (k, w) = (i as f64 - c, 2.0 * PI * i as f64 / (n - 1) as f64);
+                    let sinc = if k == 0.0 {
+                        2.0 * fc
+                    } else {
+                        (2.0 * PI * fc * k).sin() / (PI * k)
+                    };
+                    sinc * (0.42 - 0.5 * w.cos() + 0.08 * (2.0 * w).cos())
+                })
+                .collect();
+            let g = l as f64 / h.iter().sum::<f64>(); // the zeros put in by `l` cost that gain
+            h.iter().map(|v| (v * g) as f32).collect()
+        };
+        Input {
+            enc,
+            odd: None,
+            l,
+            m,
+            h,
+            x: vec![],
+            t: 0,
+        }
     }
-    let (pairs, _) = bytes.as_chunks::<2>();
-    pairs
-        .iter()
-        .map(|p| i16::from_le_bytes(*p) as f32 / 32768.0)
-        .collect()
+
+    fn push(&mut self, b: &[u8]) -> Vec<f32> {
+        match self.enc {
+            "mulaw" => self.x.extend(b.iter().map(|&v| ulaw(v) as f32 / 32768.0)),
+            "alaw" => self.x.extend(b.iter().map(|&v| alaw(v) as f32 / 32768.0)),
+            _ => {
+                let bytes: Vec<u8> = self
+                    .odd
+                    .take()
+                    .into_iter()
+                    .chain(b.iter().copied())
+                    .collect();
+                let (pairs, rest) = bytes.as_chunks::<2>();
+                self.odd = rest.first().copied();
+                self.x.extend(
+                    pairs
+                        .iter()
+                        .map(|p| i16::from_le_bytes(*p) as f32 / 32768.0),
+                );
+            }
+        }
+        let mut out = Vec::new();
+        while self.t / self.l < self.x.len() {
+            // the taps of this output's phase over the newest inputs back
+            let (mut i, mut n, mut s) = (self.t / self.l, self.t % self.l, 0.0);
+            loop {
+                s += self.h[n] * self.x[i];
+                n += self.l;
+                if n >= self.h.len() || i == 0 {
+                    break;
+                }
+                i -= 1;
+            }
+            out.push(s);
+            self.t += self.m;
+        }
+        let keep = ((self.t + 1).saturating_sub(self.h.len()) / self.l).min(self.x.len());
+        self.x.drain(..keep);
+        self.t -= keep * self.l;
+        out
+    }
+}
+
+/// G.711 mu-law to linear.
+fn ulaw(b: u8) -> i32 {
+    let u = !b as i32;
+    let t = (((u & 0x0f) << 3) + 0x84) << ((u & 0x70) >> 4);
+    if u & 0x80 != 0 { 0x84 - t } else { t - 0x84 }
+}
+
+/// G.711 A-law to linear.
+fn alaw(b: u8) -> i32 {
+    let a = (b ^ 0x55) as i32;
+    let (m, e) = ((a & 0x0f) << 4, (a & 0x70) >> 4);
+    let t = match e {
+        0 => m + 8,
+        _ => (m + 0x108) << (e - 1),
+    };
+    if a & 0x80 != 0 { t } else { -t }
 }
 
 /// The `type` of a JSON control message.
@@ -732,10 +1042,104 @@ mod tests {
 
     #[test]
     fn pcm_carries_an_odd_byte_to_the_next_frame() {
-        let mut odd = None;
-        assert_eq!(pcm(&[0x00, 0x80, 0xff], &mut odd), vec![-1.0]);
-        assert_eq!(pcm(&[0x7f], &mut odd), vec![32767.0 / 32768.0]);
-        assert_eq!(odd, None);
+        let mut i = Input::new("linear16", SR);
+        assert_eq!(i.push(&[0x00, 0x80, 0xff]), vec![-1.0]);
+        assert_eq!(i.push(&[0x7f]), vec![32767.0 / 32768.0]);
+        assert_eq!(i.odd, None);
+    }
+
+    #[test]
+    fn g711() {
+        for (b, v) in [
+            (0xff, 0),
+            (0x7f, 0),
+            (0xf0, 120),
+            (0x80, 32124),
+            (0x00, -32124),
+        ] {
+            assert_eq!(ulaw(b), v, "mulaw {b:#04x}");
+        }
+        for (b, v) in [
+            (0xd5, 8),
+            (0x55, -8),
+            (0xd4, 24),
+            (0x00, -5504),
+            (0xaa, 32256),
+            (0x2a, -32256),
+        ] {
+            assert_eq!(alaw(b), v, "alaw {b:#04x}");
+        }
+    }
+
+    /// PCM16 LE of a 0.5 amplitude tone, `secs` long.
+    fn tone(f: f64, rate: usize, secs: f64) -> Vec<u8> {
+        (0..(secs * rate as f64) as usize)
+            .flat_map(|n| {
+                let v = 0.5 * (2.0 * std::f64::consts::PI * f * n as f64 / rate as f64).sin();
+                ((v * 32767.0) as i16).to_le_bytes()
+            })
+            .collect()
+    }
+
+    /// The amplitude at `f` Hz over 1 s of 16 kHz output after the first 0.1 s (integer Hz: an exact DFT bin).
+    fn amp(y: &[f32], f: f64) -> f64 {
+        let w = 2.0 * std::f64::consts::PI * f / SR as f64;
+        let (re, im) =
+            y[1600..1600 + SR]
+                .iter()
+                .enumerate()
+                .fold((0.0, 0.0), |(re, im), (n, &v)| {
+                    (
+                        re + v as f64 * (w * n as f64).cos(),
+                        im + v as f64 * (w * n as f64).sin(),
+                    )
+                });
+        2.0 * (re * re + im * im).sqrt() / SR as f64
+    }
+
+    #[test]
+    fn resampler_keeps_tones_and_stops_aliases() {
+        let db = |a: f64| 20.0 * (0.5 / a).log10();
+        // rate, an unwanted tone at the input and where it lands at 16 kHz (an alias, or the image of 1 kHz at 8 kHz)
+        for (rate, bad, at) in [
+            (8000, 1000.0, 7000.0),
+            (16000, 0.0, 0.0),
+            (24000, 10000.0, 6000.0),
+            (48000, 10000.0, 6000.0),
+        ] {
+            let y = Input::new("linear16", rate).push(&tone(1000.0, rate, 1.2));
+            assert_eq!(y.len(), 19200, "{rate}: {} samples", y.len());
+            let a = amp(&y, 1000.0);
+            assert!((0.47..0.53).contains(&a), "{rate}: 1 kHz at {a}");
+            if at > 0.0 {
+                let y = Input::new("linear16", rate).push(&tone(bad, rate, 1.2));
+                let s = db(amp(&y, at));
+                eprintln!("{rate} Hz: {bad} Hz in, {at} Hz out, {s:.1} dB down");
+                assert!(s >= 60.0, "{rate}: {bad} Hz only {s:.1} dB down at {at} Hz");
+            }
+        }
+    }
+
+    #[test]
+    fn resampler_does_not_depend_on_the_frames() {
+        for (enc, rate) in [
+            ("linear16", 8000),
+            ("linear16", 24000),
+            ("linear16", 48000),
+            ("mulaw", 24000),
+            ("alaw", 48000),
+        ] {
+            let x = tone(1000.0, rate, 0.3);
+            let whole = Input::new(enc, rate).push(&x);
+            let mut i = Input::new(enc, rate);
+            let (mut parts, mut at, mut k) = (vec![], 0, 0);
+            while at < x.len() {
+                let n = [1, 3, 7, 64, 321, 1000][k % 6].min(x.len() - at);
+                parts.extend(i.push(&x[at..at + n]));
+                (at, k) = (at + n, k + 1);
+            }
+            assert_eq!(parts, whole, "{enc} {rate}");
+        }
     }
 
     #[test]

@@ -52,11 +52,12 @@ Authorization: Token <key>
 
 | Query key | Handling |
 |---|---|
-| `encoding` | Required. Must be `linear16` (PCM16 little-endian, mono). Any other value gets a 400. |
-| `sample_rate` | Must be `16000`, or left out. Any other value gets a 400. |
+| `encoding` | Required. `linear16` (PCM16 little-endian), `mulaw` or `alaw` (G.711, one byte per sample), always mono. Any other value (`linear32`, `opus`, `ogg-opus`, containers) gets a 400. |
+| `sample_rate` | `8000`, `16000`, `24000` or `48000`, with any of the encodings. Left out, it is `16000`. Any other value (`44100` too) gets a 400. The server resamples to 16 kHz on arrival, so every time and `lag_ms`, `dropped_ms` and `TINYASR_QUEUE_MS` still count seconds of the client's audio. |
 | `language_hint` | Optional and repeatable. A comma list also works. `ru`, `ru-RU` and `ru_RU` all map to `ru`. A language the model does not have gets a 400. With no hint the server uses `TINYASR_LANGS`. Each extra language makes every re-decode cost one more pass. |
 | `eot_threshold` | Default 0.7, range 0 to 1. |
 | `eot_timeout_ms` | Default 5000, range 100 to 60000. |
+| `eager_eot_threshold` | Optional, range 0.3 to 0.9, not greater than `eot_threshold` (both get a 400). Turns on `EagerEndOfTurn` and `TurnResumed`. Left out, the server sends neither. |
 | `model`, `keyterm`, `numerals`, anything else | Accepted and ignored. |
 
 Refusals are a plain HTTP status with a JSON body such as `{"err_code":"INVALID_AUTH","err_msg":"Invalid credentials."}`:
@@ -72,7 +73,7 @@ The 101 response has a `dg-request-id` header.
 
 ### Client to server
 
-- Binary frames: PCM16 LE audio of any length. An odd trailing byte waits for the next frame.
+- Binary frames: audio in the session's `encoding` and `sample_rate`, of any length. With `linear16` an odd trailing byte waits for the next frame.
 - `{"type":"CloseStream"}`: the server finishes the session and sends what is left (the last `EndOfTurn`). Then it closes the socket with code 1000.
 - Ping frames get a pong. Any other text message is ignored.
 
@@ -87,27 +88,45 @@ At connect:
 Then `TurnInfo` messages (values illustrative):
 
 ```json
-{"type":"TurnInfo","request_id":"…","sequence_id":12,"event":"StartOfTurn","turn_index":0,"audio_window_start":0.32,"audio_window_end":1.28,"transcript":"сервер","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.000}
-{"type":"TurnInfo","request_id":"…","sequence_id":13,"event":"Update","turn_index":0,"audio_window_start":0.32,"audio_window_end":1.28,"transcript":"сервер","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.000}
-{"type":"TurnInfo","request_id":"…","sequence_id":30,"event":"EndOfTurn","turn_index":0,"audio_window_start":0.32,"audio_window_end":4.36,"transcript":"Сервер базы данных упал после обновления платежей.","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.712,"trigger":"model"}
-{"type":"TurnInfo","request_id":"…","sequence_id":31,"event":"Update","turn_index":1,"audio_window_start":4.36,"audio_window_end":4.52,"transcript":"","words":[],"languages":[],"languages_hinted":["ru"],"end_of_turn_confidence":0.000}
+{"type":"TurnInfo","request_id":"…","sequence_id":12,"event":"StartOfTurn","turn_index":0,"audio_window_start":0.32,"audio_window_end":1.28,"transcript":"сервер","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.000,"lag_ms":40,"dropped_ms":0}
+{"type":"TurnInfo","request_id":"…","sequence_id":13,"event":"Update","turn_index":0,"audio_window_start":0.32,"audio_window_end":1.28,"transcript":"сервер","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.000,"lag_ms":40,"dropped_ms":0}
+{"type":"TurnInfo","request_id":"…","sequence_id":30,"event":"EndOfTurn","turn_index":0,"audio_window_start":0.32,"audio_window_end":4.36,"transcript":"Сервер базы данных упал после обновления платежей.","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.712,"trigger":"model","silence_ms":480,"lag_ms":120,"dropped_ms":0}
+{"type":"TurnInfo","request_id":"…","sequence_id":31,"event":"Update","turn_index":1,"audio_window_start":4.36,"audio_window_end":4.52,"transcript":"","words":[],"languages":[],"languages_hinted":["ru"],"end_of_turn_confidence":0.000,"lag_ms":0,"dropped_ms":0}
 ```
 
 - `StartOfTurn`: the first recognized word of a turn.
 - `Update`: the transcript of the open turn changed. Committed sentences are followed by the words that are not final yet.
 - `EndOfTurn`: the final transcript of the turn. `turn_index` goes up by one per turn.
+- `EagerEndOfTurn` (only with `eager_eot_threshold`): a probable end of turn. The transcript is the current text of the turn, never empty, and `end_of_turn_confidence` is the head's score. See [Eager end of turn](#eager-end-of-turn).
+- `TurnResumed` (only after an `EagerEndOfTurn`): the transcript changed after the `EagerEndOfTurn`. It carries the new text and takes the place of that `Update`. The turn goes on.
 - `languages`: the language of the turn, one code. It is the language the recognizer is decoding in, or with `TINYASR_LID` on, the language tinylid hears in the `EndOfTurn`. It is `[]` while the transcript is empty.
 - `languages_hinted`: the `language_hint` codes of the session, as the server maps them (`ru-RU` becomes `ru`). It is `[]` when the client sent no hint and the server uses `TINYASR_LANGS`.
-- Heartbeat: when no other message went out for 200 ms, the server repeats the current state as an `Update`. This also happens in silence, where the transcript is empty and `turn_index` is the next turn. Clients can use the steady stream as a liveness signal.
+- Heartbeat: when the recognizer has processed 0.2 s of audio since the last message of any kind, the server repeats the current state as an `Update`. This also happens in silence and in noise, where the transcript is empty and `turn_index` is the next turn. Flux says: "Update messages are sent for approximately every 0.25 seconds of transcribed audio, regardless of transcript updates". This server uses 0.2 s because the audio comes in 40 ms frames, and 0.25 s would round up to 0.28 s. The clock is processed audio, not wall time. The wall-clock spacing is 0.2 s plus the decode time, measured at 0.3 to 0.5 s during speech. The `audio_window_end` step between two messages is not always 0.2 s: after a decode the worker catches up on the queued audio, so one `Update` can cover more (measured 0.28 to 0.32 s routinely after a decode, at most 0.56 to 0.60 s; Flux itself says "approximately"). If the recognizer stalls, the messages stop, and a client watchdog can detect that. No audio in means no messages out.
+- `lag_ms` (every `TurnInfo`, this server's own): audio received minus audio processed when the message went out. It grows when the recognizer falls behind.
+- `dropped_ms` (every `TurnInfo`, this server's own): audio the queue has dropped in this session so far (see `TINYASR_QUEUE_MS`).
+- `silence_ms` (`EndOfTurn` only, this server's own): the silence since the pause began, when the library reported the pause. It is absent when the model has no end-of-turn head or the turn ended during speech.
 - If a session fails inside (a panic), the server sends `{"type":"Error","sequence_id":n,"code":"INTERNAL_SERVER_ERROR","description":"…"}` and closes with 1011. Other sessions keep running.
 
 End of turn:
 
 1. Model: the library's end-of-turn head says `p >= eot_threshold` at a pause, and the library then closes that sentence. The trigger is `model`.
-2. Timeout: no new word for `eot_timeout_ms` of audio after the last word of the turn. The trigger is `timeout`.
+2. Timeout: `eot_timeout_ms` of silence, as in Flux (the longest silence before a forced end of turn; new speech resets the timer). The silence starts where the library reports a pause began (its end-of-turn head runs at 0.24 s into it), and a word newer than the pause clears it. Speech that resumes without a recognized word does not clear it until the next pause replaces it. With a model that has no end-of-turn head, the timeout counts from the end of the newest word instead, and a session counts as such until its first pause. The trigger is `timeout`.
 3. `CloseStream` with a turn still open. The trigger is `manual`.
 
 All times are seconds of the client's audio stream, dropped audio included.
+
+### Eager end of turn
+
+With `eager_eot_threshold` set, the server sends `EagerEndOfTurn` when the head scores an open turn with a nonempty transcript at or above that threshold and no earlier `EagerEndOfTurn` of the turn is still outstanding. The head runs at 0.24 s of silence, so the eager event comes at about 0.24 s of silence and `EndOfTurn` at about 0.48 s.
+
+- Any change of the transcript after an `EagerEndOfTurn` sends `TurnResumed` with the new text instead of an `Update`. A later pause can then give a new `EagerEndOfTurn`.
+- Flux says: "The transcript in EagerEndOfTurn will exactly match the transcript in the subsequent EndOfTurn event". When the turn ends and its final text differs from the outstanding `EagerEndOfTurn`, the server sends `TurnResumed`, `EagerEndOfTurn` (both with the final text, the eager score) and `EndOfTurn` back to back. This happens when the library's final re-decode before the `Commit` changes words or punctuation.
+- The timeout and `CloseStream` paths send only `EndOfTurn`. They never send an `EagerEndOfTurn` of their own, except for the sequence above. Flux does not say what its timeout does.
+- `lag_ms` and `dropped_ms` are on these messages too. `trigger` and `silence_ms` are on `EndOfTurn` only.
+
+Where the library limits this: its head always reports a score at 0.24 s of silence, but its own decision threshold is fixed at 0.5. A yes (p > 0.5) leads to the `Commit` at 0.48 s. After a no, the head runs once more at 0.48 s of the same pause. A no also makes the library append `...` to the shown text, so with an `eager_eot_threshold` below 0.5 an eager event on a no is followed at once by a `TurnResumed` with that text. The server does not hide it. Values below 0.5 therefore give eager events that the model path mostly does not confirm. When speech resumes between 0.24 s and 0.48 s, the library sends no event, and the new words show up as a `TurnResumed`.
+
+Alternative design, not implemented: the library could finish the sentence at 0.24 s, so that `EndOfTurn` itself comes 0.24 s earlier. That needs a change of the upstream library or a fork. Its own comment says the freeze waits for 0.48 s so that the re-decode hears the end of the last word, so the accuracy would have to be measured again.
 
 ## Known differences from the vendor protocol
 
@@ -116,9 +135,9 @@ All times are seconds of the client's audio stream, dropped audio included.
 - The end of turn comes about 0.8 s after the end of speech (measured on Russian TTS). That is the head at 0.24 s plus the library's sentence freeze at 0.48 s plus the decode. With `eot_threshold` under 0.5, the library still freezes the sentence only at p > 0.5. A turn that the head scores between the threshold and 0.5 therefore ends after 3 s of silence.
 - The timeout counts audio, not wall time. If a client stops sending audio, the timeout never fires.
 - The numeric fields are JSON numbers. The vendor's schema documents `audio_window_*` and `end_of_turn_confidence` as strings, but the reference client this server was checked against parses them as numbers.
-- `EagerEndOfTurn`, `TurnResumed`, `eager_eot_threshold`, `Configure`/`ConfigureSuccess`, `ForceEndTurn`, `Warning`, `keyterm`, `numerals`, and `redact` are not implemented. Unknown query keys and text messages are ignored, not refused.
+- `Configure`/`ConfigureSuccess`, `ForceEndTurn`, `Warning`, `keyterm`, `numerals`, and `redact` are not implemented. Unknown query keys and text messages are ignored, not refused.
 - `languages` holds one code per turn, never several. Without `TINYASR_LID` it is the recognizer's pick among the session's languages. With `TINYASR_LID`, the `EndOfTurn` carries tinylid's top language from the first 3 s of the turn. That can be a language the model cannot transcribe, so a client that hinted `en` and gets `ru` knows the speaker is outside its hint. `StartOfTurn` and `Update` keep the recognizer's pick. Short turns (a word or two) give unreliable labels.
-- Only `linear16` at 16 kHz is supported. There are no containers, no mu-law and no other rates.
+- Only `linear16`, `mulaw` and `alaw` at 8, 16, 24 and 48 kHz are accepted. `linear32`, `opus`, `ogg-opus`, 44.1 kHz and containers get a 400: decoding opus and containers belongs in a gateway in front of the server, which keeps it free of codec dependencies. Input at 8 kHz is upsampled to 16 kHz, but the model was trained on 16 kHz audio, and its accuracy on phone-band audio has not been measured beyond the bundled clip (which the tests send band-limited to 8 kHz, as linear16 and as mu-law, with the same transcript).
 - `model` is ignored. The served model is `TINYASR_MODEL` (by default en, ru, uk).
 - The 503 for a full server and the JSON error bodies are this server's own. The vendor's limits and bodies differ.
 - When the queue overflows (the decode falls behind by more than `TINYASR_QUEUE_MS`), the oldest audio is dropped. The amount is logged. The transcript then misses that audio, and `audio_window_*` keep the client's timeline.
@@ -136,8 +155,20 @@ All times are seconds of the client's audio stream, dropped audio included.
 | `TINYASR_MAX_SESSIONS` | CPU count | Concurrent sessions. The next upgrade gets a 503. |
 | `TINYASR_LID` | unset | Path of `tinylid.bin`, normally `/models/tinylid.bin` (inside the full image; the slim image fetches it). If set, `languages` of each `EndOfTurn` comes from tinylid, which adds about 90 ms to the end of turn. Unset, the model is not loaded. |
 | `TINYASR_QUEUE_MS` | `3000` | Audio queue per session. When it overflows, the oldest audio is dropped. |
+| `TINYASR_TRACE` | unset | `1`: one `trace` log line per second per session: `t_s`, `push_n`, `push_ms`, `push_max_ms` (time in the library this second), `proc_s`, `recv_s`, `queue_s`, `dropped_s` (audio processed, received, queued, dropped), `open_words`, `open_s` (the open sentence), `turn_chars`, `msgs`, `msg_bytes` (sent this second), `rss_mb`. |
 
-The log goes to stderr. There is one line per session start (peer, request id, languages, thresholds) and one per session end (reason, duration, audio seconds, dropped seconds, turns). Transcripts are never logged.
+The log goes to stderr. There is one line per session start (peer, request id, languages, thresholds) and one per session end (reason, duration, audio seconds, dropped seconds, turns). Session transcripts are never logged.
+
+### Self-test and `/health`
+
+At start, after the models load and before the port opens, the server decodes a bundled 5 s Russian clip (`tests/data/ru5.s16`, embedded in the binary) once through the same session worker that serves clients. The start log gets one `self-test` line with the result, the decode time and the clip's transcript. The decode takes about 1.6 s on an i9-10900KF, so the port opens that much later.
+
+| `GET /health` | When |
+|---|---|
+| 200 `{"status":"ok"}` | The self-test passed. |
+| 503 `{"status":"self-test failed","reason":"…"}` | The decode failed, or the transcript differs from the clip's text. The server still serves sessions, so the failure shows in `/health` and in the log. |
+
+Model language rule: when the model has `ru`, the transcript must equal the clip's text, compared as lowercase words without punctuation (`ё` as `е`). When it has no `ru` (for example `en-es-it-pt`), the self-test checks only that the decode completes, logs that the transcript check was skipped, and `/health` is 200. A model or VAD file that cannot be read or loaded still stops the server at start.
 
 ## Build and run
 
@@ -179,13 +210,17 @@ docker run --rm -v tasr-cargo:/usr/local/cargo/registry -v tasr-cargo-git:/usr/l
 
 Measured on an i9-10900KF (10 cores, WSL2) with beam 4 and the Russian 5 s clip at real-time pace plus 4 s of silence:
 
-| Sessions | End of turn after end of speech, mean / max | Max gap between messages | Dropped audio |
-|---|---|---|---|
-| 1 | 0.78 to 0.87 s | 216 ms | 0 |
-| 4 | 0.75 / 0.80 s | 216 ms | 0 |
-| 8 | 0.76 / 0.80 s | 220 ms | 0 |
-| 16 | 1.05 / 1.34 s | 220 ms | 0 |
-| 24 | 2.33 / 2.95 s | 240 ms | 0 |
+| Sessions | End of turn after end of speech, mean / max | Dropped audio |
+|---|---|---|
+| 1 | 0.78 to 0.87 s | 0 |
+| 4 | 0.75 / 0.80 s | 0 |
+| 8 | 0.76 / 0.80 s | 0 |
+| 16 | 1.05 / 1.34 s | 0 |
+| 24 | 2.33 / 2.95 s | 0 |
+
+The heartbeat goes out per 0.2 s of processed audio, so the wall-clock gap between messages is 0.2 s plus the decode time, measured up to about 0.55 s in the test suite.
+
+Capacity on a small machine: measured with a 2-core limit on real-time long takes, the decoder lag starts to grow above 2 parallel sessions (above 1 session on 1 core), with beam 4 and with beam 1. Beam 1 (`TINYASR_BEAM=1`) roughly halves the time to the first partial, at an accuracy cost: it is cheaper and can lose punctuation, and the tinyasr README gives Russian FLEURS WER 5.47 % for the beam 4 second pass against 7.22 % for the greedy streaming pass. Accuracy at beam 1 was not measured here.
 
 ## Releases
 

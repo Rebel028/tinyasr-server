@@ -2,6 +2,10 @@
 
 use tinyasr::{Event, Word};
 
+/// Silence at the end-of-turn head's first and second look at a pause (the library's `PAD` and twice it, 40 ms frames).
+const EOU_AT: f64 = 0.24;
+const EOU_LATE: f64 = 0.48;
+
 /// One `TurnInfo` message. Times are seconds of the client's audio stream (dropped audio included).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Msg {
@@ -14,11 +18,21 @@ pub struct Msg {
     pub trigger: Option<&'static str>,
     /// The detected language code; not sent while the transcript is empty.
     pub lang: String,
+    /// `EndOfTurn` only: s of silence since the pause began, when the library reported the pause.
+    pub silence: Option<f64>,
 }
 
 impl Msg {
     /// `hinted`: the session's `language_hint` codes as a JSON array (see `list`).
-    pub fn json(&self, request_id: &str, hinted: &str, seq: u64) -> String {
+    /// `lag_ms`: audio received minus audio processed; `dropped_ms`: audio the queue dropped in this session.
+    pub fn json(
+        &self,
+        request_id: &str,
+        hinted: &str,
+        seq: u64,
+        lag_ms: u64,
+        dropped_ms: u64,
+    ) -> String {
         let langs = if self.transcript.is_empty() {
             "[]".into()
         } else {
@@ -27,8 +41,11 @@ impl Msg {
         let trigger = self
             .trigger
             .map_or(String::new(), |t| format!(",\"trigger\":\"{t}\""));
+        let silence = self.silence.map_or(String::new(), |s| {
+            format!(",\"silence_ms\":{:.0}", s * 1000.0)
+        });
         format!(
-            "{{\"type\":\"TurnInfo\",\"request_id\":\"{request_id}\",\"sequence_id\":{seq},\"event\":\"{}\",\"turn_index\":{},\"audio_window_start\":{:.2},\"audio_window_end\":{:.2},\"transcript\":{},\"words\":[],\"languages\":{langs},\"languages_hinted\":{hinted},\"end_of_turn_confidence\":{:.3}{trigger}}}",
+            "{{\"type\":\"TurnInfo\",\"request_id\":\"{request_id}\",\"sequence_id\":{seq},\"event\":\"{}\",\"turn_index\":{},\"audio_window_start\":{:.2},\"audio_window_end\":{:.2},\"transcript\":{},\"words\":[],\"languages\":{langs},\"languages_hinted\":{hinted},\"end_of_turn_confidence\":{:.3}{trigger}{silence},\"lag_ms\":{lag_ms},\"dropped_ms\":{dropped_ms}}}",
             self.event,
             self.turn_index,
             self.start,
@@ -49,12 +66,14 @@ impl Msg {
                 conf: 0.0,
                 trigger: None,
                 lang: self.lang.clone(),
+                silence: None,
                 ..*self
             }
         } else {
             Msg {
                 event: "Update",
                 trigger: None,
+                silence: None,
                 transcript: self.transcript.clone(),
                 lang: self.lang.clone(),
                 ..*self
@@ -73,9 +92,14 @@ pub struct Turns {
     start: f64,                  // stream s where the turn (or the idle gap) began
     last_word: f64,              // library s: end of the newest word of the turn
     pending: Option<(f32, f64)>, // end-of-turn head said yes at a pause: (p, library s of that pause)
+    pause: Option<f64>, // library s where the silence the head judged began; None once speech went on
+    head: bool,         // the model has the end-of-turn head (an Eou came)
     last_p: f32,
     skip_commit: bool, // the turn was closed on open words: their later Commit is already reported
     lang: String,      // the library's current language
+    /// `eager_eot_threshold`; None: no eager events.
+    pub eager: Option<f32>,
+    eager_sent: Option<(String, f32)>, // the EagerEndOfTurn not yet resumed or ended: (transcript, p)
 }
 
 impl Turns {
@@ -90,9 +114,13 @@ impl Turns {
             start: 0.0,
             last_word: 0.0,
             pending: None,
+            pause: None,
+            head: false,
             last_p: 0.0,
             skip_commit: false,
             lang: lang.into(),
+            eager: None,
+            eager_sent: None,
         }
     }
 
@@ -111,13 +139,12 @@ impl Turns {
                     return;
                 }
                 self.partial = text;
-                self.last_p = 0.0;
                 if self.partial.trim().is_empty() {
                     return;
                 }
                 self.words(&ws);
                 self.begin(&ws, pos, off, out);
-                out.push(self.msg("Update", pos, off, self.last_p, None));
+                self.update(pos, off, 0.0, out);
             }
             Event::Commit(ws) => {
                 self.partial.clear();
@@ -132,24 +159,53 @@ impl Turns {
                 self.committed.push_str(&text);
                 self.words(&ws);
                 self.begin(&ws, pos, off, out);
+                // the library can freeze an earlier sentence first, in the same push: it does so only for a sentence end
+                // it heard 1.5 s before, so a Commit that ends more than 1 s before the pause leaves words of the turn
+                let reaches = |p0: f64| ws.last().is_some_and(|w| w.end as f64 > p0 - 1.0);
                 match self.pending {
-                    Some((p, _)) => self.end(p, "model", pos, off, out),
-                    None => out.push(self.msg("Update", pos, off, self.last_p, None)),
+                    Some((p, _)) if self.pause.is_none_or(reaches) => {
+                        self.end(p, "model", pos, off, out)
+                    }
+                    _ => self.update(pos, off, self.last_p, out),
                 }
             }
             Event::Eou { at, p } => {
+                let at = at as f64;
                 self.last_p = p;
+                self.head = true;
+                // the head runs at 0.24 s of silence, and after a "no" at 0.48 s of the same pause
+                if !self
+                    .pause
+                    .is_some_and(|p0| (at - EOU_LATE - p0).abs() < 0.02)
+                {
+                    self.pause = Some(at - EOU_AT);
+                }
                 if self.open {
-                    self.pending = (p >= self.thr).then_some((p, at as f64));
+                    self.pending = (p >= self.thr).then_some((p, at));
+                    if self.eager.is_some_and(|e| p >= e) && self.eager_sent.is_none() {
+                        let m = self.msg("EagerEndOfTurn", pos, off, p, None);
+                        if !m.transcript.is_empty() {
+                            self.eager_sent = Some((m.transcript.clone(), p));
+                            out.push(m);
+                        }
+                    }
                 }
             }
             Event::Language(l) => self.lang = l,
         }
     }
 
-    /// After each push: the silence timeout.
+    /// After each push: the silence timeout. Silence starts where the library's pause began (as Flux, speech resets
+    /// it); a model without the end-of-turn head reports no pause, so there it starts at the end of the newest word.
+    /// shortcut: speech that resumes and shows no word yet leaves the old pause running (the library does not report
+    /// the VAD), and a session counts as headless until its first Eou; upgrade when the library reports both.
     pub fn tick(&mut self, pos: f64, off: f64, out: &mut Vec<Msg>) {
-        if self.open && pos - self.last_word >= self.timeout {
+        let from = if self.head {
+            self.pause
+        } else {
+            Some(self.last_word)
+        };
+        if self.open && from.is_some_and(|q| pos - q >= self.timeout) {
             self.skip_commit = !self.partial.trim().is_empty();
             self.end(self.last_p, "timeout", pos, off, out);
         }
@@ -171,6 +227,9 @@ impl Turns {
         if self.pending.is_some_and(|(_, at)| newest > at) {
             self.pending = None;
         }
+        if self.pause.is_some_and(|p0| newest > p0 + EOU_AT) {
+            self.pause = None;
+        }
         self.last_word = newest;
     }
 
@@ -180,17 +239,40 @@ impl Turns {
         }
         self.open = true;
         self.pending = None;
+        self.eager_sent = None;
         self.start = ws.first().map_or(pos, |w| w.start as f64) + off;
         out.push(self.msg("StartOfTurn", pos, off, 0.0, None));
     }
 
+    /// An `Update`, or a `TurnResumed` when the transcript left the one of the outstanding `EagerEndOfTurn`.
+    fn update(&mut self, pos: f64, off: f64, conf: f32, out: &mut Vec<Msg>) {
+        let mut m = self.msg("Update", pos, off, conf, None);
+        if self
+            .eager_sent
+            .take_if(|(t, _)| *t != m.transcript)
+            .is_some()
+        {
+            m.event = "TurnResumed";
+        }
+        out.push(m);
+    }
+
     fn end(&mut self, p: f32, trigger: &'static str, pos: f64, off: f64, out: &mut Vec<Msg>) {
-        out.push(self.msg("EndOfTurn", pos, off, p, Some(trigger)));
+        let mut m = self.msg("EndOfTurn", pos, off, p, Some(trigger));
+        m.silence = self.pause.map(|p0| pos - p0);
+        // Flux: the EagerEndOfTurn transcript matches the EndOfTurn one exactly, so a changed text is announced first
+        if let Some((_, ep)) = self.eager_sent.take_if(|(t, _)| *t != m.transcript) {
+            out.push(self.msg("TurnResumed", pos, off, ep, None));
+            out.push(self.msg("EagerEndOfTurn", pos, off, ep, None));
+        }
+        out.push(m);
+        self.eager_sent = None;
         self.index += 1;
         self.open = false;
         self.committed.clear();
         self.partial.clear();
         self.pending = None;
+        self.pause = None;
         self.last_p = 0.0;
         self.start = pos + off;
     }
@@ -217,6 +299,7 @@ impl Turns {
             conf,
             trigger,
             lang: self.lang.clone(),
+            silence: None,
         }
     }
 }
@@ -313,6 +396,7 @@ mod tests {
             ]
         );
         assert_eq!((o[4].conf, o[4].trigger), (0.8, Some("model")));
+        assert!((o[4].silence.unwrap() - 0.48).abs() < 1e-3);
         assert_eq!(o[4].heartbeat().turn_index, 1);
         t.on(part(&[w("да", 3.0, 3.2)]), 3.3, 0.5, &mut o);
         assert_eq!(
@@ -335,9 +419,10 @@ mod tests {
         t.on(Event::Commit(vec![w("Два.", 1.7, 2.0)]), 2.2, 0.0, &mut o); // ". and the next sentence started" rule
         assert!(o.iter().all(|m| m.event != "EndOfTurn"));
         assert_eq!(o.last().unwrap().transcript, "Один. Два.");
+        t.on(Event::Eou { at: 2.24, p: 0.3 }, 2.24, 0.0, &mut o); // the pause after "два" (from 2.0)
         t.tick(6.9, 0.0, &mut o);
         assert!(o.iter().all(|m| m.event != "EndOfTurn"));
-        t.tick(7.0, 0.0, &mut o);
+        t.tick(7.01, 0.0, &mut o);
         let m = o.last().unwrap();
         assert_eq!(
             (m.event, m.trigger, m.transcript.as_str()),
@@ -369,10 +454,344 @@ mod tests {
             conf: 0.75,
             trigger: Some("model"),
             lang: "ru".into(),
+            silence: Some(0.48),
         };
         assert_eq!(
-            m.json("r", &list(&["ru", "en"]), 7),
-            r#"{"type":"TurnInfo","request_id":"r","sequence_id":7,"event":"EndOfTurn","turn_index":2,"audio_window_start":1.00,"audio_window_end":2.50,"transcript":"a \"b\"","words":[],"languages":["ru"],"languages_hinted":["ru","en"],"end_of_turn_confidence":0.750,"trigger":"model"}"#
+            m.json("r", &list(&["ru", "en"]), 7, 120, 40),
+            r#"{"type":"TurnInfo","request_id":"r","sequence_id":7,"event":"EndOfTurn","turn_index":2,"audio_window_start":1.00,"audio_window_end":2.50,"transcript":"a \"b\"","words":[],"languages":["ru"],"languages_hinted":["ru","en"],"end_of_turn_confidence":0.750,"trigger":"model","silence_ms":480,"lag_ms":120,"dropped_ms":40}"#
+        );
+        let hb = m.heartbeat().json("r", "[]", 8, 0, 0);
+        assert!(
+            hb.ends_with(r#""end_of_turn_confidence":0.000,"lag_ms":0,"dropped_ms":0}"#),
+            "{hb}"
+        );
+    }
+
+    #[test]
+    fn timeout_counts_silence_and_keeps_the_head_score() {
+        let mut t = Turns::new(0.7, 1500, "ru");
+        let mut o = vec![];
+        t.on(part(&[w("да", 0.1, 0.4)]), 0.6, 0.0, &mut o);
+        t.on(Event::Eou { at: 0.84, p: 0.3 }, 0.84, 0.0, &mut o); // pause from 0.6
+        t.on(part(&[w("да.", 0.1, 0.4)]), 0.92, 0.0, &mut o); // a changed partial does not lose the score
+        t.on(Event::Eou { at: 1.08, p: 0.6 }, 1.08, 0.0, &mut o); // the second look at the same pause
+        t.tick(2.09, 0.0, &mut o);
+        assert!(o.iter().all(|m| m.event != "EndOfTurn"));
+        t.tick(2.11, 0.0, &mut o);
+        let m = o.last().unwrap();
+        assert_eq!(
+            (m.event, m.trigger, m.conf),
+            ("EndOfTurn", Some("timeout"), 0.6)
+        );
+        assert!((m.silence.unwrap() - 1.51).abs() < 1e-3);
+    }
+
+    #[test]
+    fn timeout_waits_through_speech_with_late_words() {
+        let mut t = Turns::new(0.5, 1500, "ru");
+        let mut o = vec![];
+        t.on(part(&[w("один", 0.1, 0.5)]), 0.8, 0.0, &mut o);
+        t.on(Event::Eou { at: 0.84, p: 0.2 }, 0.84, 0.0, &mut o);
+        t.on(
+            part(&[w("один", 0.1, 0.5), w("два", 0.9, 1.3)]),
+            2.0,
+            0.0,
+            &mut o,
+        );
+        // the speaker goes on; the next word shows 1.6 s after "два" ended (the old rule fired at 2.8)
+        for i in 0..13 {
+            t.tick(2.04 + 0.2 * i as f64, 0.0, &mut o);
+        }
+        t.on(
+            part(&[w("один", 0.1, 0.5), w("два", 0.9, 1.3), w("три", 1.4, 3.0)]),
+            4.6,
+            0.0,
+            &mut o,
+        );
+        t.tick(4.64, 0.0, &mut o);
+        assert!(o.iter().all(|m| m.event != "EndOfTurn"));
+    }
+
+    #[test]
+    fn resumed_speech_clears_the_pause() {
+        let mut t = Turns::new(0.7, 1500, "ru");
+        let mut o = vec![];
+        t.on(part(&[w("один", 0.1, 0.5)]), 0.8, 0.0, &mut o);
+        t.on(Event::Eou { at: 1.0, p: 0.2 }, 1.0, 0.0, &mut o); // pause from 0.76
+        t.on(
+            part(&[w("один", 0.1, 0.5), w("два", 1.1, 1.5)]),
+            1.8,
+            0.0,
+            &mut o,
+        );
+        t.tick(2.3, 0.0, &mut o);
+        assert!(o.iter().all(|m| m.event != "EndOfTurn"));
+        // speech with no word shown, then a new pause from 2.76: the old pause does not count
+        t.on(Event::Eou { at: 3.0, p: 0.2 }, 3.0, 0.0, &mut o);
+        t.tick(4.25, 0.0, &mut o);
+        assert!(o.iter().all(|m| m.event != "EndOfTurn"));
+        t.tick(4.27, 0.0, &mut o);
+        assert_eq!(o.last().unwrap().trigger, Some("timeout"));
+    }
+
+    #[test]
+    fn model_end_of_turn_waits_for_the_commit_that_reaches_the_pause() {
+        // the real events of a clip with a pause mid-phrase (0.5 / 1500): two Commits in one push
+        let mut t = Turns::new(0.5, 1500, "ru");
+        let mut o = vec![];
+        let first = [
+            w("Кто", 10.04, 10.16),
+            w("вы", 10.36, 10.4),
+            w("такие?", 10.4, 10.44),
+        ];
+        t.on(part(&first), 10.76, 0.0, &mut o);
+        let all = [
+            w("Здравствуйте,", 9.12, 9.32),
+            w("а", 9.76, 9.8),
+            w("Кто", 10.12, 10.16),
+            w("вы", 10.4, 10.56),
+            w("такие?", 10.56, 10.6),
+            w("Вы", 11.04, 11.2),
+            w("ещё", 11.2, 11.36),
+            w("на", 11.36, 11.4),
+            w("связи?", 11.4, 11.44),
+        ];
+        t.on(part(&all), 11.72, 0.0, &mut o);
+        t.on(
+            Event::Eou {
+                at: 12.36,
+                p: 0.675,
+            },
+            12.36,
+            0.0,
+            &mut o,
+        );
+        let a = vec![
+            w("Здравствуйте,", 9.12, 9.32),
+            w("а", 9.76, 9.8),
+            w("Кто", 10.12, 10.16),
+            w("вы", 10.44, 10.6),
+            w("такие?", 10.6, 10.64),
+        ];
+        let b = vec![
+            w("Вы", 11.08, 11.24),
+            w("ещё", 11.24, 11.28),
+            w("на", 11.56, 11.72),
+            w("связи?", 11.72, 11.92),
+        ];
+        t.on(Event::Commit(a), 12.6, 0.0, &mut o);
+        t.on(Event::Commit(b), 12.6, 0.0, &mut o);
+        t.on(part(&[]), 12.6, 0.0, &mut o);
+        t.tick(12.6, 0.0, &mut o);
+        let ends: Vec<_> = o.iter().filter(|m| m.event == "EndOfTurn").collect();
+        assert_eq!(ends.len(), 1, "{:?}", events(&o));
+        assert_eq!(
+            (ends[0].transcript.as_str(), ends[0].trigger, ends[0].conf),
+            (
+                "Здравствуйте, а Кто вы такие? Вы ещё на связи?",
+                Some("model"),
+                0.675
+            )
+        );
+        assert_eq!(t.count(), 1);
+    }
+
+    #[test]
+    fn timeout_without_the_head_counts_from_the_newest_word() {
+        let mut t = Turns::new(0.7, 1500, "ru");
+        let mut o = vec![];
+        t.on(part(&[w("алло", 0.1, 0.5)]), 0.8, 0.0, &mut o);
+        t.tick(1.99, 0.0, &mut o);
+        assert!(o.iter().all(|m| m.event != "EndOfTurn"));
+        t.tick(2.0, 0.0, &mut o);
+        let m = o.last().unwrap();
+        assert_eq!(
+            (m.event, m.trigger, m.silence),
+            ("EndOfTurn", Some("timeout"), None)
+        );
+    }
+
+    fn eager(e: Option<f32>, thr: f32) -> Turns {
+        let mut t = Turns::new(thr, 1500, "ru");
+        t.eager = e;
+        t
+    }
+
+    #[test]
+    fn eager_then_end_with_the_same_text() {
+        let mut t = eager(Some(0.5), 0.7);
+        let mut o = vec![];
+        let ws = [w("сервер", 0.2, 0.6), w("упал", 0.7, 1.0)];
+        t.on(part(&ws), 1.2, 0.0, &mut o);
+        t.on(Event::Eou { at: 1.24, p: 0.8 }, 1.24, 0.0, &mut o);
+        t.on(Event::Commit(ws.to_vec()), 1.48, 0.0, &mut o);
+        assert_eq!(
+            events(&o),
+            vec![
+                ("StartOfTurn", 0, "сервер упал"),
+                ("Update", 0, "сервер упал"),
+                ("EagerEndOfTurn", 0, "сервер упал"),
+                ("EndOfTurn", 0, "сервер упал")
+            ]
+        );
+        assert_eq!((o[2].conf, o[2].trigger, o[2].silence), (0.8, None, None));
+    }
+
+    #[test]
+    fn eager_then_end_with_changed_text() {
+        let mut t = eager(Some(0.5), 0.7);
+        let mut o = vec![];
+        t.on(
+            part(&[w("сервер", 0.2, 0.6), w("упал", 0.7, 1.0)]),
+            1.2,
+            0.0,
+            &mut o,
+        );
+        t.on(Event::Eou { at: 1.24, p: 0.8 }, 1.24, 0.0, &mut o);
+        t.on(
+            Event::Commit(vec![w("Сервер", 0.2, 0.6), w("упал.", 0.7, 1.0)]),
+            1.48,
+            0.0,
+            &mut o,
+        );
+        assert_eq!(
+            events(&o[2..]),
+            vec![
+                ("EagerEndOfTurn", 0, "сервер упал"),
+                ("TurnResumed", 0, "Сервер упал."),
+                ("EagerEndOfTurn", 0, "Сервер упал."),
+                ("EndOfTurn", 0, "Сервер упал.")
+            ]
+        );
+        assert_eq!((o[4].conf, o[5].trigger), (0.8, Some("model")));
+    }
+
+    #[test]
+    fn eager_then_resumed_then_eager_again() {
+        let mut t = eager(Some(0.5), 0.7);
+        let mut o = vec![];
+        t.on(part(&[w("один", 0.1, 0.5)]), 0.6, 0.0, &mut o);
+        t.on(Event::Eou { at: 0.8, p: 0.6 }, 0.8, 0.0, &mut o);
+        let both = [w("один", 0.1, 0.5), w("два", 0.9, 1.2)];
+        t.on(part(&both), 1.3, 0.0, &mut o);
+        t.on(Event::Eou { at: 1.44, p: 0.9 }, 1.44, 0.0, &mut o);
+        t.on(Event::Commit(both.to_vec()), 1.68, 0.0, &mut o);
+        assert_eq!(
+            events(&o[2..]),
+            vec![
+                ("EagerEndOfTurn", 0, "один"),
+                ("TurnResumed", 0, "один два"),
+                ("EagerEndOfTurn", 0, "один два"),
+                ("EndOfTurn", 0, "один два")
+            ]
+        );
+        assert_eq!((o[2].conf, o[4].conf), (0.6, 0.9));
+    }
+
+    #[test]
+    fn eager_then_timeout_sends_only_the_end() {
+        let mut t = eager(Some(0.5), 0.7);
+        let mut o = vec![];
+        t.on(part(&[w("да", 0.1, 0.4)]), 0.6, 0.0, &mut o);
+        t.on(Event::Eou { at: 0.84, p: 0.6 }, 0.84, 0.0, &mut o);
+        t.on(Event::Eou { at: 1.08, p: 0.6 }, 1.08, 0.0, &mut o); // still outstanding: no second eager event
+        t.tick(2.11, 0.0, &mut o);
+        assert_eq!(
+            events(&o[2..]),
+            vec![("EagerEndOfTurn", 0, "да"), ("EndOfTurn", 0, "да")]
+        );
+        assert_eq!(o[3].trigger, Some("timeout"));
+    }
+
+    #[test]
+    fn no_eager_event_without_a_transcript() {
+        let mut t = eager(Some(0.5), 0.7);
+        let mut o = vec![];
+        t.on(Event::Eou { at: 0.5, p: 0.9 }, 0.5, 0.0, &mut o); // no turn yet
+        t.on(part(&[w("да", 1.0, 1.3)]), 1.4, 0.0, &mut o);
+        t.finish(1.5, 0.0, &mut o);
+        t.on(Event::Eou { at: 1.8, p: 0.9 }, 1.8, 0.0, &mut o); // the turn is over
+        assert_eq!(
+            events(&o),
+            vec![
+                ("StartOfTurn", 0, "да"),
+                ("Update", 0, "да"),
+                ("EndOfTurn", 0, "да")
+            ]
+        );
+    }
+
+    #[test]
+    fn no_parameter_no_eager_events() {
+        let run = |e: Option<f32>| {
+            let mut t = eager(e, 0.7);
+            let mut o = vec![];
+            t.on(part(&[w("один", 0.1, 0.5)]), 0.6, 0.0, &mut o);
+            t.on(Event::Eou { at: 0.8, p: 0.6 }, 0.8, 0.0, &mut o);
+            let both = [w("один", 0.1, 0.5), w("два", 0.9, 1.2)];
+            t.on(part(&both), 1.3, 0.0, &mut o);
+            t.on(Event::Eou { at: 1.44, p: 0.9 }, 1.44, 0.0, &mut o);
+            t.on(
+                Event::Commit(vec![w("Один", 0.1, 0.5), w("два.", 0.9, 1.2)]),
+                1.68,
+                0.0,
+                &mut o,
+            );
+            o
+        };
+        let off = run(None);
+        assert!(
+            off.iter()
+                .all(|m| !matches!(m.event, "EagerEndOfTurn" | "TurnResumed")),
+            "{:?}",
+            events(&off)
+        );
+        // the same messages as with eager events, once those are taken out (a TurnResumed stands for an Update)
+        let mut on = run(Some(0.5));
+        on.retain(|m| m.event != "EagerEndOfTurn");
+        let n = on.len();
+        on.retain(|m| {
+            !(m.event == "TurnResumed" && m.transcript == off.last().unwrap().transcript)
+        }); // before the end
+        assert_eq!(n - on.len(), 1);
+        for m in &mut on {
+            if m.event == "TurnResumed" {
+                m.event = "Update";
+            }
+        }
+        assert_eq!(on, off);
+    }
+
+    #[test]
+    fn eager_below_one_half_and_the_dots() {
+        // the head says no (p <= 0.5): the library shows "..." and looks again at 0.48 s
+        let mut t = eager(Some(0.3), 0.5);
+        let mut o = vec![];
+        let ws = [w("сервер", 0.2, 0.6), w("упал", 0.7, 1.0)];
+        t.on(part(&ws), 1.2, 0.0, &mut o);
+        t.on(Event::Eou { at: 1.24, p: 0.4 }, 1.24, 0.0, &mut o);
+        t.on(
+            Event::Partial {
+                open: ws.to_vec(),
+                tail: vec![Word {
+                    text: "...".into(),
+                    start: 1.0,
+                    end: 1.0,
+                    join: true,
+                }],
+            },
+            1.24,
+            0.0,
+            &mut o,
+        );
+        t.on(Event::Eou { at: 1.48, p: 0.45 }, 1.48, 0.0, &mut o);
+        assert_eq!(
+            events(&o[2..]),
+            vec![
+                ("EagerEndOfTurn", 0, "сервер упал"),
+                ("TurnResumed", 0, "сервер упал..."),
+                ("EagerEndOfTurn", 0, "сервер упал...")
+            ]
         );
     }
 
@@ -382,10 +801,10 @@ mod tests {
         let mut o = vec![];
         t.on(Event::Language("uk".into()), 0.5, 0.0, &mut o);
         t.on(part(&[w("так", 0.1, 0.4)]), 0.6, 0.0, &mut o);
-        let m = o.last().unwrap().json("r", "[]", 1);
+        let m = o.last().unwrap().json("r", "[]", 1, 0, 0);
         assert!(m.contains(r#""languages":["uk"]"#), "{m}");
         t.finish(1.0, 0.0, &mut o);
-        let idle = o.last().unwrap().heartbeat().json("r", "[]", 9);
+        let idle = o.last().unwrap().heartbeat().json("r", "[]", 9, 0, 0);
         assert!(
             idle.contains(r#""transcript":"","words":[],"languages":[],"languages_hinted":[]"#),
             "{idle}"
