@@ -52,8 +52,8 @@ Authorization: Token <key>
 
 | Query key | Handling |
 |---|---|
-| `encoding` | Required. Must be `linear16` (PCM16 little-endian, mono). Any other value gets a 400. |
-| `sample_rate` | Must be `16000`, or left out. Any other value gets a 400. |
+| `encoding` | Required. `linear16` (PCM16 little-endian), `mulaw` or `alaw` (G.711, one byte per sample), always mono. Any other value (`linear32`, `opus`, `ogg-opus`, containers) gets a 400. |
+| `sample_rate` | `8000`, `16000`, `24000` or `48000`, with any of the encodings. Left out, it is `16000`. Any other value (`44100` too) gets a 400. The server resamples to 16 kHz on arrival, so every time and `lag_ms`, `dropped_ms` and `TINYASR_QUEUE_MS` still count seconds of the client's audio. |
 | `language_hint` | Optional and repeatable. A comma list also works. `ru`, `ru-RU` and `ru_RU` all map to `ru`. A language the model does not have gets a 400. With no hint the server uses `TINYASR_LANGS`. Each extra language makes every re-decode cost one more pass. |
 | `eot_threshold` | Default 0.7, range 0 to 1. |
 | `eot_timeout_ms` | Default 5000, range 100 to 60000. |
@@ -73,7 +73,7 @@ The 101 response has a `dg-request-id` header.
 
 ### Client to server
 
-- Binary frames: PCM16 LE audio of any length. An odd trailing byte waits for the next frame.
+- Binary frames: audio in the session's `encoding` and `sample_rate`, of any length. With `linear16` an odd trailing byte waits for the next frame.
 - `{"type":"CloseStream"}`: the server finishes the session and sends what is left (the last `EndOfTurn`). Then it closes the socket with code 1000.
 - Ping frames get a pong. Any other text message is ignored.
 
@@ -137,7 +137,7 @@ Alternative design, not implemented: the library could finish the sentence at 0.
 - The numeric fields are JSON numbers. The vendor's schema documents `audio_window_*` and `end_of_turn_confidence` as strings, but the reference client this server was checked against parses them as numbers.
 - `Configure`/`ConfigureSuccess`, `ForceEndTurn`, `Warning`, `keyterm`, `numerals`, and `redact` are not implemented. Unknown query keys and text messages are ignored, not refused.
 - `languages` holds one code per turn, never several. Without `TINYASR_LID` it is the recognizer's pick among the session's languages. With `TINYASR_LID`, the `EndOfTurn` carries tinylid's top language from the first 3 s of the turn. That can be a language the model cannot transcribe, so a client that hinted `en` and gets `ru` knows the speaker is outside its hint. `StartOfTurn` and `Update` keep the recognizer's pick. Short turns (a word or two) give unreliable labels.
-- Only `linear16` at 16 kHz is supported. There are no containers, no mu-law and no other rates.
+- Only `linear16`, `mulaw` and `alaw` at 8, 16, 24 and 48 kHz are accepted. `linear32`, `opus`, `ogg-opus`, 44.1 kHz and containers get a 400: decoding opus and containers belongs in a gateway in front of the server, which keeps it free of codec dependencies. Input at 8 kHz is upsampled to 16 kHz, but the model was trained on 16 kHz audio, and its accuracy on phone-band audio has not been measured beyond the bundled clip (which the tests send band-limited to 8 kHz, as linear16 and as mu-law, with the same transcript).
 - `model` is ignored. The served model is `TINYASR_MODEL` (by default en, ru, uk).
 - The 503 for a full server and the JSON error bodies are this server's own. The vendor's limits and bodies differ.
 - When the queue overflows (the decode falls behind by more than `TINYASR_QUEUE_MS`), the oldest audio is dropped. The amount is logged. The transcript then misses that audio, and `audio_window_*` keep the client's timeline.

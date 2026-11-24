@@ -50,6 +50,8 @@ struct Params {
     thr: f32,
     timeout_ms: u32,
     eager: Option<f32>,
+    enc: &'static str, // linear16, mulaw or alaw
+    rate: usize,
 }
 
 fn env(k: &str, d: &str) -> String {
@@ -275,12 +277,19 @@ fn params(cfg: &Cfg, req: &Req) -> Result<Params, String> {
             _ => {} // model, keyterm, numerals and the rest: accepted and ignored
         }
     }
-    if enc != Some("linear16") {
-        return Err("Only encoding=linear16 (PCM16 little-endian, mono) is supported.".into());
-    }
-    if rate.is_some_and(|r| r != "16000") {
-        return Err("Only sample_rate=16000 is supported.".into());
-    }
+    let enc = match enc {
+        Some("linear16") => "linear16",
+        Some("mulaw") => "mulaw",
+        Some("alaw") => "alaw",
+        _ => return Err("Supported: encoding=linear16 (PCM16 little-endian), mulaw or alaw, mono, no container.".into()),
+    };
+    let rate = match rate.unwrap_or("16000") {
+        "8000" => 8000,
+        "16000" => 16000,
+        "24000" => 24000,
+        "48000" => 48000,
+        _ => return Err("Supported: sample_rate=8000, 16000, 24000 or 48000.".into()),
+    };
     if eager.is_some_and(|e| e > thr) {
         return Err("eager_eot_threshold must not be greater than eot_threshold.".into());
     }
@@ -294,6 +303,8 @@ fn params(cfg: &Cfg, req: &Req) -> Result<Params, String> {
         thr,
         timeout_ms,
         eager,
+        enc,
+        rate,
     })
 }
 
@@ -314,6 +325,7 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
     let pos = Arc::new(AtomicU64::new(0)); // stream samples the worker has processed
     let sent = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]); // messages, bytes; counted only with trace on
     let (tx, rx) = mpsc::channel::<Msg>();
+    let mut input = Input::new(p.enc, p.rate);
     let worker = {
         let (cfg, audio, pos, sent) = (cfg.clone(), audio.clone(), pos.clone(), sent.clone());
         std::thread::Builder::new()
@@ -347,11 +359,10 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
         let ms = |v: u64| v * 1000 / SR as u64;
         (ms(got.saturating_sub(p)), ms(dropped), p)
     };
-    let mut odd = None;
     let mut closing: Option<Instant> = None;
     while ok {
         match ws.read() {
-            Ok(Message::Binary(b)) => audio.push(pcm(&b, &mut odd)),
+            Ok(Message::Binary(b)) => audio.push(input.push(&b)),
             Ok(Message::Text(t)) => {
                 if msg_type(&t) == Some("CloseStream") {
                     audio.set(State::Finish);
@@ -603,10 +614,13 @@ fn self_test(cfg: &Cfg) -> Result<(), String> {
         thr: 0.7,
         timeout_ms: 5000,
         eager: None,
+        enc: "linear16",
+        rate: SR,
     };
     let audio = Audio::new(usize::MAX);
+    let mut input = Input::new(p.enc, p.rate);
     for f in CLIP.chunks(1280) {
-        audio.push(pcm(f, &mut None));
+        audio.push(input.push(f));
     }
     audio.set(State::Finish);
     let (tx, rx) = mpsc::channel();
@@ -759,17 +773,118 @@ impl Audio {
     }
 }
 
-/// PCM16 LE to f32; an odd byte waits for the next frame.
-fn pcm(b: &[u8], odd: &mut Option<u8>) -> Vec<f32> {
-    let mut bytes: Vec<u8> = odd.take().into_iter().chain(b.iter().copied()).collect();
-    if bytes.len() % 2 == 1 {
-        *odd = bytes.pop();
+/// A session's binary frames (linear16, mu-law or A-law at 8, 16, 24 or 48 kHz) as 16 kHz samples.
+/// Resampling: up by `l`, a Blackman-windowed sinc low-pass at `rate * l`, down by `m`, as one polyphase FIR.
+struct Input {
+    enc: &'static str,
+    odd: Option<u8>, // a linear16 byte that waits for the next frame
+    l: usize,
+    m: usize,
+    h: Vec<f32>,
+    x: Vec<f32>, // input samples still under the filter
+    t: usize,    // the next output, at `rate * l`, counted from x[0]
+}
+
+impl Input {
+    fn new(enc: &'static str, rate: usize) -> Input {
+        let (l, m) = match rate {
+            8000 => (2, 1),
+            24000 => (2, 3),
+            48000 => (1, 3),
+            _ => (1, 1),
+        };
+        let h = if l * m == 1 {
+            vec![1.0]
+        } else {
+            use std::f64::consts::PI;
+            let r = (rate * l) as f64;
+            // Blackman: transition 6 / n of the rate, here 1 kHz, from 500 Hz below to the lower Nyquist
+            let n = (6.0 * r / 1000.0) as usize + 1;
+            let fc = ((rate.min(SR) / 2) as f64 - 500.0) / r;
+            let c = (n - 1) as f64 / 2.0;
+            let h: Vec<f64> = (0..n)
+                .map(|i| {
+                    let (k, w) = (i as f64 - c, 2.0 * PI * i as f64 / (n - 1) as f64);
+                    let sinc = if k == 0.0 {
+                        2.0 * fc
+                    } else {
+                        (2.0 * PI * fc * k).sin() / (PI * k)
+                    };
+                    sinc * (0.42 - 0.5 * w.cos() + 0.08 * (2.0 * w).cos())
+                })
+                .collect();
+            let g = l as f64 / h.iter().sum::<f64>(); // the zeros put in by `l` cost that gain
+            h.iter().map(|v| (v * g) as f32).collect()
+        };
+        Input {
+            enc,
+            odd: None,
+            l,
+            m,
+            h,
+            x: vec![],
+            t: 0,
+        }
     }
-    let (pairs, _) = bytes.as_chunks::<2>();
-    pairs
-        .iter()
-        .map(|p| i16::from_le_bytes(*p) as f32 / 32768.0)
-        .collect()
+
+    fn push(&mut self, b: &[u8]) -> Vec<f32> {
+        match self.enc {
+            "mulaw" => self.x.extend(b.iter().map(|&v| ulaw(v) as f32 / 32768.0)),
+            "alaw" => self.x.extend(b.iter().map(|&v| alaw(v) as f32 / 32768.0)),
+            _ => {
+                let bytes: Vec<u8> = self
+                    .odd
+                    .take()
+                    .into_iter()
+                    .chain(b.iter().copied())
+                    .collect();
+                let (pairs, rest) = bytes.as_chunks::<2>();
+                self.odd = rest.first().copied();
+                self.x.extend(
+                    pairs
+                        .iter()
+                        .map(|p| i16::from_le_bytes(*p) as f32 / 32768.0),
+                );
+            }
+        }
+        let mut out = Vec::new();
+        while self.t / self.l < self.x.len() {
+            // the taps of this output's phase over the newest inputs back
+            let (mut i, mut n, mut s) = (self.t / self.l, self.t % self.l, 0.0);
+            loop {
+                s += self.h[n] * self.x[i];
+                n += self.l;
+                if n >= self.h.len() || i == 0 {
+                    break;
+                }
+                i -= 1;
+            }
+            out.push(s);
+            self.t += self.m;
+        }
+        let keep = ((self.t + 1).saturating_sub(self.h.len()) / self.l).min(self.x.len());
+        self.x.drain(..keep);
+        self.t -= keep * self.l;
+        out
+    }
+}
+
+/// G.711 mu-law to linear.
+fn ulaw(b: u8) -> i32 {
+    let u = !b as i32;
+    let t = (((u & 0x0f) << 3) + 0x84) << ((u & 0x70) >> 4);
+    if u & 0x80 != 0 { 0x84 - t } else { t - 0x84 }
+}
+
+/// G.711 A-law to linear.
+fn alaw(b: u8) -> i32 {
+    let a = (b ^ 0x55) as i32;
+    let (m, e) = ((a & 0x0f) << 4, (a & 0x70) >> 4);
+    let t = match e {
+        0 => m + 8,
+        _ => (m + 0x108) << (e - 1),
+    };
+    if a & 0x80 != 0 { t } else { -t }
 }
 
 /// The `type` of a JSON control message.
@@ -927,10 +1042,104 @@ mod tests {
 
     #[test]
     fn pcm_carries_an_odd_byte_to_the_next_frame() {
-        let mut odd = None;
-        assert_eq!(pcm(&[0x00, 0x80, 0xff], &mut odd), vec![-1.0]);
-        assert_eq!(pcm(&[0x7f], &mut odd), vec![32767.0 / 32768.0]);
-        assert_eq!(odd, None);
+        let mut i = Input::new("linear16", SR);
+        assert_eq!(i.push(&[0x00, 0x80, 0xff]), vec![-1.0]);
+        assert_eq!(i.push(&[0x7f]), vec![32767.0 / 32768.0]);
+        assert_eq!(i.odd, None);
+    }
+
+    #[test]
+    fn g711() {
+        for (b, v) in [
+            (0xff, 0),
+            (0x7f, 0),
+            (0xf0, 120),
+            (0x80, 32124),
+            (0x00, -32124),
+        ] {
+            assert_eq!(ulaw(b), v, "mulaw {b:#04x}");
+        }
+        for (b, v) in [
+            (0xd5, 8),
+            (0x55, -8),
+            (0xd4, 24),
+            (0x00, -5504),
+            (0xaa, 32256),
+            (0x2a, -32256),
+        ] {
+            assert_eq!(alaw(b), v, "alaw {b:#04x}");
+        }
+    }
+
+    /// PCM16 LE of a 0.5 amplitude tone, `secs` long.
+    fn tone(f: f64, rate: usize, secs: f64) -> Vec<u8> {
+        (0..(secs * rate as f64) as usize)
+            .flat_map(|n| {
+                let v = 0.5 * (2.0 * std::f64::consts::PI * f * n as f64 / rate as f64).sin();
+                ((v * 32767.0) as i16).to_le_bytes()
+            })
+            .collect()
+    }
+
+    /// The amplitude at `f` Hz over 1 s of 16 kHz output after the first 0.1 s (integer Hz: an exact DFT bin).
+    fn amp(y: &[f32], f: f64) -> f64 {
+        let w = 2.0 * std::f64::consts::PI * f / SR as f64;
+        let (re, im) =
+            y[1600..1600 + SR]
+                .iter()
+                .enumerate()
+                .fold((0.0, 0.0), |(re, im), (n, &v)| {
+                    (
+                        re + v as f64 * (w * n as f64).cos(),
+                        im + v as f64 * (w * n as f64).sin(),
+                    )
+                });
+        2.0 * (re * re + im * im).sqrt() / SR as f64
+    }
+
+    #[test]
+    fn resampler_keeps_tones_and_stops_aliases() {
+        let db = |a: f64| 20.0 * (0.5 / a).log10();
+        // rate, an unwanted tone at the input and where it lands at 16 kHz (an alias, or the image of 1 kHz at 8 kHz)
+        for (rate, bad, at) in [
+            (8000, 1000.0, 7000.0),
+            (16000, 0.0, 0.0),
+            (24000, 10000.0, 6000.0),
+            (48000, 10000.0, 6000.0),
+        ] {
+            let y = Input::new("linear16", rate).push(&tone(1000.0, rate, 1.2));
+            assert_eq!(y.len(), 19200, "{rate}: {} samples", y.len());
+            let a = amp(&y, 1000.0);
+            assert!((0.47..0.53).contains(&a), "{rate}: 1 kHz at {a}");
+            if at > 0.0 {
+                let y = Input::new("linear16", rate).push(&tone(bad, rate, 1.2));
+                let s = db(amp(&y, at));
+                eprintln!("{rate} Hz: {bad} Hz in, {at} Hz out, {s:.1} dB down");
+                assert!(s >= 60.0, "{rate}: {bad} Hz only {s:.1} dB down at {at} Hz");
+            }
+        }
+    }
+
+    #[test]
+    fn resampler_does_not_depend_on_the_frames() {
+        for (enc, rate) in [
+            ("linear16", 8000),
+            ("linear16", 24000),
+            ("linear16", 48000),
+            ("mulaw", 24000),
+            ("alaw", 48000),
+        ] {
+            let x = tone(1000.0, rate, 0.3);
+            let whole = Input::new(enc, rate).push(&x);
+            let mut i = Input::new(enc, rate);
+            let (mut parts, mut at, mut k) = (vec![], 0, 0);
+            while at < x.len() {
+                let n = [1, 3, 7, 64, 321, 1000][k % 6].min(x.len() - at);
+                parts.extend(i.push(&x[at..at + n]));
+                (at, k) = (at + n, k + 1);
+            }
+            assert_eq!(parts, whole, "{enc} {rate}");
+        }
     }
 
     #[test]
