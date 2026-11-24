@@ -335,9 +335,10 @@ fn turns_heartbeats_and_close() {
     }
 
     // heartbeats while audio streams, in speech, in silence and in noise: one per 0.2 s of processed audio.
-    // The audio step is printed, not checked: after a decode the worker catches up between two polls (up to 0.56 s).
+    // After a decode the worker catches up between two polls, so one step can exceed 0.2 s (measured up to 0.6 s).
     let (gap, step) = log.gaps(silence_from);
     assert!(gap <= Duration::from_secs(1), "max gap {gap:?}");
+    assert!(step <= 0.8, "max audio step {step:.2} s");
     assert_eq!(quiet, 0, "messages without audio");
     // 1 s of silence and 1 s of noise: the Updates go on, with the same (empty) next turn
     let idle = &log.msgs[idle_from..silence_from];
@@ -550,6 +551,7 @@ fn concurrent_sessions() {
         "concurrent n={n}: end-of-turn after speech end mean {lat_mean:?} max {lat_max:?}; max message gap {gap:?}, max audio step {step:.2} s"
     );
     assert!(gap <= Duration::from_secs(1), "max gap {gap:?}");
+    assert!(step <= 0.8, "max audio step {step:.2} s");
 }
 
 #[test]
