@@ -57,6 +57,7 @@ Authorization: Token <key>
 | `language_hint` | Optional and repeatable. A comma list also works. `ru`, `ru-RU` and `ru_RU` all map to `ru`. A language the model does not have gets a 400. With no hint the server uses `TINYASR_LANGS`. Each extra language makes every re-decode cost one more pass. |
 | `eot_threshold` | Default 0.7, range 0 to 1. |
 | `eot_timeout_ms` | Default 5000, range 100 to 60000. |
+| `eager_eot_threshold` | Optional, range 0.3 to 0.9, not greater than `eot_threshold` (both get a 400). Turns on `EagerEndOfTurn` and `TurnResumed`. Left out, the server sends neither. |
 | `model`, `keyterm`, `numerals`, anything else | Accepted and ignored. |
 
 Refusals are a plain HTTP status with a JSON body such as `{"err_code":"INVALID_AUTH","err_msg":"Invalid credentials."}`:
@@ -96,6 +97,8 @@ Then `TurnInfo` messages (values illustrative):
 - `StartOfTurn`: the first recognized word of a turn.
 - `Update`: the transcript of the open turn changed. Committed sentences are followed by the words that are not final yet.
 - `EndOfTurn`: the final transcript of the turn. `turn_index` goes up by one per turn.
+- `EagerEndOfTurn` (only with `eager_eot_threshold`): a probable end of turn. The transcript is the current text of the turn, never empty, and `end_of_turn_confidence` is the head's score. See [Eager end of turn](#eager-end-of-turn).
+- `TurnResumed` (only after an `EagerEndOfTurn`): the transcript changed after the `EagerEndOfTurn`. It carries the new text and takes the place of that `Update`. The turn goes on.
 - `languages`: the language of the turn, one code. It is the language the recognizer is decoding in, or with `TINYASR_LID` on, the language tinylid hears in the `EndOfTurn`. It is `[]` while the transcript is empty.
 - `languages_hinted`: the `language_hint` codes of the session, as the server maps them (`ru-RU` becomes `ru`). It is `[]` when the client sent no hint and the server uses `TINYASR_LANGS`.
 - Heartbeat: when the recognizer has processed 0.2 s of audio since the last message of any kind, the server repeats the current state as an `Update`. This also happens in silence and in noise, where the transcript is empty and `turn_index` is the next turn. Flux says: "Update messages are sent for approximately every 0.25 seconds of transcribed audio, regardless of transcript updates". This server uses 0.2 s because the audio comes in 40 ms frames, and 0.25 s would round up to 0.28 s. The clock is processed audio, not wall time. The wall-clock spacing is 0.2 s plus the decode time, measured at 0.3 to 0.5 s during speech. If the recognizer stalls, the messages stop, and a client watchdog can detect that. No audio in means no messages out.
@@ -112,6 +115,19 @@ End of turn:
 
 All times are seconds of the client's audio stream, dropped audio included.
 
+### Eager end of turn
+
+With `eager_eot_threshold` set, the server sends `EagerEndOfTurn` when the head scores an open turn with a nonempty transcript at or above that threshold and no earlier `EagerEndOfTurn` of the turn is still outstanding. The head runs at 0.24 s of silence, so the eager event comes at about 0.24 s of silence and `EndOfTurn` at about 0.48 s.
+
+- Any change of the transcript after an `EagerEndOfTurn` sends `TurnResumed` with the new text instead of an `Update`. A later pause can then give a new `EagerEndOfTurn`.
+- Flux says: "The transcript in EagerEndOfTurn will exactly match the transcript in the subsequent EndOfTurn event". When the turn ends and its final text differs from the outstanding `EagerEndOfTurn`, the server sends `TurnResumed`, `EagerEndOfTurn` (both with the final text, the eager score) and `EndOfTurn` back to back. This happens when the library's final re-decode before the `Commit` changes words or punctuation.
+- The timeout and `CloseStream` paths send only `EndOfTurn`. They never send an `EagerEndOfTurn` of their own, except for the sequence above. Flux does not say what its timeout does.
+- `lag_ms` and `dropped_ms` are on these messages too. `trigger` and `silence_ms` are on `EndOfTurn` only.
+
+Where the library limits this: its head always reports a score at 0.24 s of silence, but its own decision threshold is fixed at 0.5. A yes (p > 0.5) leads to the `Commit` at 0.48 s. After a no, the head runs once more at 0.48 s of the same pause. A no also makes the library append `...` to the shown text, so with an `eager_eot_threshold` below 0.5 an eager event on a no is followed at once by a `TurnResumed` with that text. The server does not hide it. Values below 0.5 therefore give eager events that the model path mostly does not confirm. When speech resumes between 0.24 s and 0.48 s, the library sends no event, and the new words show up as a `TurnResumed`.
+
+Alternative design, not implemented: the library could finish the sentence at 0.24 s, so that `EndOfTurn` itself comes 0.24 s earlier. That needs a change of the upstream library or a fork. Its own comment says the freeze waits for 0.48 s so that the re-decode hears the end of the last word, so the accuracy would have to be measured again.
+
 ## Known differences from the vendor protocol
 
 - `words` is always `[]`. The library has no per-word confidence. Its word times are not sent.
@@ -119,7 +135,7 @@ All times are seconds of the client's audio stream, dropped audio included.
 - The end of turn comes about 0.8 s after the end of speech (measured on Russian TTS). That is the head at 0.24 s plus the library's sentence freeze at 0.48 s plus the decode. With `eot_threshold` under 0.5, the library still freezes the sentence only at p > 0.5. A turn that the head scores between the threshold and 0.5 therefore ends after 3 s of silence.
 - The timeout counts audio, not wall time. If a client stops sending audio, the timeout never fires.
 - The numeric fields are JSON numbers. The vendor's schema documents `audio_window_*` and `end_of_turn_confidence` as strings, but the reference client this server was checked against parses them as numbers.
-- `EagerEndOfTurn`, `TurnResumed`, `eager_eot_threshold`, `Configure`/`ConfigureSuccess`, `ForceEndTurn`, `Warning`, `keyterm`, `numerals`, and `redact` are not implemented. Unknown query keys and text messages are ignored, not refused.
+- `Configure`/`ConfigureSuccess`, `ForceEndTurn`, `Warning`, `keyterm`, `numerals`, and `redact` are not implemented. Unknown query keys and text messages are ignored, not refused.
 - `languages` holds one code per turn, never several. Without `TINYASR_LID` it is the recognizer's pick among the session's languages. With `TINYASR_LID`, the `EndOfTurn` carries tinylid's top language from the first 3 s of the turn. That can be a language the model cannot transcribe, so a client that hinted `en` and gets `ru` knows the speaker is outside its hint. `StartOfTurn` and `Update` keep the recognizer's pick. Short turns (a word or two) give unreliable labels.
 - Only `linear16` at 16 kHz is supported. There are no containers, no mu-law and no other rates.
 - `model` is ignored. The served model is `TINYASR_MODEL` (by default en, ru, uk).

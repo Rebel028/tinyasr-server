@@ -342,6 +342,8 @@ fn turns_heartbeats_and_close() {
         idle.iter().map(|m| &m.1).collect::<Vec<_>>()
     );
     assert!(log.closed, "no close frame");
+    // no eager_eot_threshold: no eager events
+    assert!(log.turns("EagerEndOfTurn").is_empty() && log.turns("TurnResumed").is_empty());
     eprintln!(
         "turn latency after speech end: {:?}; max message gap {gap:?}, max audio step {step:.2} s; {} messages",
         lat,
@@ -368,6 +370,51 @@ fn stalled_worker_goes_quiet() {
     assert!(lag >= 500, "lag after the stall {lag} ms");
     log.close(&mut ws);
     eprintln!("stall: gap {gap:?}, lag after it {lag} ms");
+}
+
+#[test]
+fn eager_end_of_turn() {
+    let srv = start(&[]);
+    let mut ws = connect(srv.port, &format!("{Q}&eager_eot_threshold=0.5"), None).unwrap();
+    let mut log = Log::default();
+    log.turn(&mut ws, &clip(), 4.0);
+    log.close(&mut ws);
+    check_turn(&log, 0);
+    let eager = log.turns("EagerEndOfTurn");
+    let eot = log.turns("EndOfTurn");
+    assert!(
+        eager.first().is_some_and(|e| e.0 <= eot[0].0),
+        "no EagerEndOfTurn before the EndOfTurn"
+    );
+    // every EndOfTurn that follows an EagerEndOfTurn without a TurnResumed in between has its transcript
+    let mut open: Option<&str> = None;
+    for m in log.msgs.iter().map(|m| &m.1) {
+        match m["event"].as_str() {
+            Some("EagerEndOfTurn") => {
+                assert!(!text(m).is_empty(), "{m}");
+                open = Some(text(m));
+            }
+            Some("TurnResumed") => open = None,
+            Some("EndOfTurn") => {
+                if let Some(t) = open.take() {
+                    assert_eq!(t, text(m));
+                }
+            }
+            _ => {}
+        }
+    }
+    eprintln!(
+        "eager: {:?} before the EndOfTurn {:?} (audio_window_end {} and {}); events {:?}",
+        eot[0].0 - eager[0].0,
+        text(eot[0].1),
+        eager[0].1["audio_window_end"],
+        eot[0].1["audio_window_end"],
+        log.msgs
+            .iter()
+            .filter_map(|m| m.1["event"].as_str())
+            .filter(|e| *e != "Update")
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -402,6 +449,25 @@ fn auth_params_and_limit() {
         connect(
             srv.port,
             "encoding=linear16&eot_threshold=1.5",
+            Some("secret")
+        )
+        .err(),
+        Some(400)
+    );
+    assert_eq!(
+        connect(
+            srv.port,
+            "encoding=linear16&eager_eot_threshold=0.2",
+            Some("secret")
+        )
+        .err(),
+        Some(400)
+    );
+    // greater than eot_threshold, whatever the key order
+    assert_eq!(
+        connect(
+            srv.port,
+            "encoding=linear16&eager_eot_threshold=0.6&eot_threshold=0.5",
             Some("secret")
         )
         .err(),

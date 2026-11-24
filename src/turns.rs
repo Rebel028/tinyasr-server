@@ -97,6 +97,9 @@ pub struct Turns {
     last_p: f32,
     skip_commit: bool, // the turn was closed on open words: their later Commit is already reported
     lang: String,      // the library's current language
+    /// `eager_eot_threshold`; None: no eager events.
+    pub eager: Option<f32>,
+    eager_sent: Option<(String, f32)>, // the EagerEndOfTurn not yet resumed or ended: (transcript, p)
 }
 
 impl Turns {
@@ -116,6 +119,8 @@ impl Turns {
             last_p: 0.0,
             skip_commit: false,
             lang: lang.into(),
+            eager: None,
+            eager_sent: None,
         }
     }
 
@@ -139,7 +144,7 @@ impl Turns {
                 }
                 self.words(&ws);
                 self.begin(&ws, pos, off, out);
-                out.push(self.msg("Update", pos, off, 0.0, None));
+                self.update(pos, off, 0.0, out);
             }
             Event::Commit(ws) => {
                 self.partial.clear();
@@ -161,7 +166,7 @@ impl Turns {
                     Some((p, _)) if self.pause.is_none_or(reaches) => {
                         self.end(p, "model", pos, off, out)
                     }
-                    _ => out.push(self.msg("Update", pos, off, self.last_p, None)),
+                    _ => self.update(pos, off, self.last_p, out),
                 }
             }
             Event::Eou { at, p } => {
@@ -177,6 +182,13 @@ impl Turns {
                 }
                 if self.open {
                     self.pending = (p >= self.thr).then_some((p, at));
+                    if self.eager.is_some_and(|e| p >= e) && self.eager_sent.is_none() {
+                        let m = self.msg("EagerEndOfTurn", pos, off, p, None);
+                        if !m.transcript.is_empty() {
+                            self.eager_sent = Some((m.transcript.clone(), p));
+                            out.push(m);
+                        }
+                    }
                 }
             }
             Event::Language(l) => self.lang = l,
@@ -227,14 +239,34 @@ impl Turns {
         }
         self.open = true;
         self.pending = None;
+        self.eager_sent = None;
         self.start = ws.first().map_or(pos, |w| w.start as f64) + off;
         out.push(self.msg("StartOfTurn", pos, off, 0.0, None));
+    }
+
+    /// An `Update`, or a `TurnResumed` when the transcript left the one of the outstanding `EagerEndOfTurn`.
+    fn update(&mut self, pos: f64, off: f64, conf: f32, out: &mut Vec<Msg>) {
+        let mut m = self.msg("Update", pos, off, conf, None);
+        if self
+            .eager_sent
+            .take_if(|(t, _)| *t != m.transcript)
+            .is_some()
+        {
+            m.event = "TurnResumed";
+        }
+        out.push(m);
     }
 
     fn end(&mut self, p: f32, trigger: &'static str, pos: f64, off: f64, out: &mut Vec<Msg>) {
         let mut m = self.msg("EndOfTurn", pos, off, p, Some(trigger));
         m.silence = self.pause.map(|p0| pos - p0);
+        // Flux: the EagerEndOfTurn transcript matches the EndOfTurn one exactly, so a changed text is announced first
+        if let Some((_, ep)) = self.eager_sent.take_if(|(t, _)| *t != m.transcript) {
+            out.push(self.msg("TurnResumed", pos, off, ep, None));
+            out.push(self.msg("EagerEndOfTurn", pos, off, ep, None));
+        }
         out.push(m);
+        self.eager_sent = None;
         self.index += 1;
         self.open = false;
         self.committed.clear();
@@ -576,6 +608,190 @@ mod tests {
         assert_eq!(
             (m.event, m.trigger, m.silence),
             ("EndOfTurn", Some("timeout"), None)
+        );
+    }
+
+    fn eager(e: Option<f32>, thr: f32) -> Turns {
+        let mut t = Turns::new(thr, 1500, "ru");
+        t.eager = e;
+        t
+    }
+
+    #[test]
+    fn eager_then_end_with_the_same_text() {
+        let mut t = eager(Some(0.5), 0.7);
+        let mut o = vec![];
+        let ws = [w("сервер", 0.2, 0.6), w("упал", 0.7, 1.0)];
+        t.on(part(&ws), 1.2, 0.0, &mut o);
+        t.on(Event::Eou { at: 1.24, p: 0.8 }, 1.24, 0.0, &mut o);
+        t.on(Event::Commit(ws.to_vec()), 1.48, 0.0, &mut o);
+        assert_eq!(
+            events(&o),
+            vec![
+                ("StartOfTurn", 0, "сервер упал"),
+                ("Update", 0, "сервер упал"),
+                ("EagerEndOfTurn", 0, "сервер упал"),
+                ("EndOfTurn", 0, "сервер упал")
+            ]
+        );
+        assert_eq!((o[2].conf, o[2].trigger, o[2].silence), (0.8, None, None));
+    }
+
+    #[test]
+    fn eager_then_end_with_changed_text() {
+        let mut t = eager(Some(0.5), 0.7);
+        let mut o = vec![];
+        t.on(
+            part(&[w("сервер", 0.2, 0.6), w("упал", 0.7, 1.0)]),
+            1.2,
+            0.0,
+            &mut o,
+        );
+        t.on(Event::Eou { at: 1.24, p: 0.8 }, 1.24, 0.0, &mut o);
+        t.on(
+            Event::Commit(vec![w("Сервер", 0.2, 0.6), w("упал.", 0.7, 1.0)]),
+            1.48,
+            0.0,
+            &mut o,
+        );
+        assert_eq!(
+            events(&o[2..]),
+            vec![
+                ("EagerEndOfTurn", 0, "сервер упал"),
+                ("TurnResumed", 0, "Сервер упал."),
+                ("EagerEndOfTurn", 0, "Сервер упал."),
+                ("EndOfTurn", 0, "Сервер упал.")
+            ]
+        );
+        assert_eq!((o[4].conf, o[5].trigger), (0.8, Some("model")));
+    }
+
+    #[test]
+    fn eager_then_resumed_then_eager_again() {
+        let mut t = eager(Some(0.5), 0.7);
+        let mut o = vec![];
+        t.on(part(&[w("один", 0.1, 0.5)]), 0.6, 0.0, &mut o);
+        t.on(Event::Eou { at: 0.8, p: 0.6 }, 0.8, 0.0, &mut o);
+        let both = [w("один", 0.1, 0.5), w("два", 0.9, 1.2)];
+        t.on(part(&both), 1.3, 0.0, &mut o);
+        t.on(Event::Eou { at: 1.44, p: 0.9 }, 1.44, 0.0, &mut o);
+        t.on(Event::Commit(both.to_vec()), 1.68, 0.0, &mut o);
+        assert_eq!(
+            events(&o[2..]),
+            vec![
+                ("EagerEndOfTurn", 0, "один"),
+                ("TurnResumed", 0, "один два"),
+                ("EagerEndOfTurn", 0, "один два"),
+                ("EndOfTurn", 0, "один два")
+            ]
+        );
+        assert_eq!((o[2].conf, o[4].conf), (0.6, 0.9));
+    }
+
+    #[test]
+    fn eager_then_timeout_sends_only_the_end() {
+        let mut t = eager(Some(0.5), 0.7);
+        let mut o = vec![];
+        t.on(part(&[w("да", 0.1, 0.4)]), 0.6, 0.0, &mut o);
+        t.on(Event::Eou { at: 0.84, p: 0.6 }, 0.84, 0.0, &mut o);
+        t.on(Event::Eou { at: 1.08, p: 0.6 }, 1.08, 0.0, &mut o); // still outstanding: no second eager event
+        t.tick(2.11, 0.0, &mut o);
+        assert_eq!(
+            events(&o[2..]),
+            vec![("EagerEndOfTurn", 0, "да"), ("EndOfTurn", 0, "да")]
+        );
+        assert_eq!(o[3].trigger, Some("timeout"));
+    }
+
+    #[test]
+    fn no_eager_event_without_a_transcript() {
+        let mut t = eager(Some(0.5), 0.7);
+        let mut o = vec![];
+        t.on(Event::Eou { at: 0.5, p: 0.9 }, 0.5, 0.0, &mut o); // no turn yet
+        t.on(part(&[w("да", 1.0, 1.3)]), 1.4, 0.0, &mut o);
+        t.finish(1.5, 0.0, &mut o);
+        t.on(Event::Eou { at: 1.8, p: 0.9 }, 1.8, 0.0, &mut o); // the turn is over
+        assert_eq!(
+            events(&o),
+            vec![
+                ("StartOfTurn", 0, "да"),
+                ("Update", 0, "да"),
+                ("EndOfTurn", 0, "да")
+            ]
+        );
+    }
+
+    #[test]
+    fn no_parameter_no_eager_events() {
+        let run = |e: Option<f32>| {
+            let mut t = eager(e, 0.7);
+            let mut o = vec![];
+            t.on(part(&[w("один", 0.1, 0.5)]), 0.6, 0.0, &mut o);
+            t.on(Event::Eou { at: 0.8, p: 0.6 }, 0.8, 0.0, &mut o);
+            let both = [w("один", 0.1, 0.5), w("два", 0.9, 1.2)];
+            t.on(part(&both), 1.3, 0.0, &mut o);
+            t.on(Event::Eou { at: 1.44, p: 0.9 }, 1.44, 0.0, &mut o);
+            t.on(
+                Event::Commit(vec![w("Один", 0.1, 0.5), w("два.", 0.9, 1.2)]),
+                1.68,
+                0.0,
+                &mut o,
+            );
+            o
+        };
+        let off = run(None);
+        assert!(
+            off.iter()
+                .all(|m| !matches!(m.event, "EagerEndOfTurn" | "TurnResumed")),
+            "{:?}",
+            events(&off)
+        );
+        // the same messages as with eager events, once those are taken out (a TurnResumed stands for an Update)
+        let mut on = run(Some(0.5));
+        on.retain(|m| m.event != "EagerEndOfTurn");
+        let n = on.len();
+        on.retain(|m| {
+            !(m.event == "TurnResumed" && m.transcript == off.last().unwrap().transcript)
+        }); // before the end
+        assert_eq!(n - on.len(), 1);
+        for m in &mut on {
+            if m.event == "TurnResumed" {
+                m.event = "Update";
+            }
+        }
+        assert_eq!(on, off);
+    }
+
+    #[test]
+    fn eager_below_one_half_and_the_dots() {
+        // the head says no (p <= 0.5): the library shows "..." and looks again at 0.48 s
+        let mut t = eager(Some(0.3), 0.5);
+        let mut o = vec![];
+        let ws = [w("сервер", 0.2, 0.6), w("упал", 0.7, 1.0)];
+        t.on(part(&ws), 1.2, 0.0, &mut o);
+        t.on(Event::Eou { at: 1.24, p: 0.4 }, 1.24, 0.0, &mut o);
+        t.on(
+            Event::Partial {
+                open: ws.to_vec(),
+                tail: vec![Word {
+                    text: "...".into(),
+                    start: 1.0,
+                    end: 1.0,
+                    join: true,
+                }],
+            },
+            1.24,
+            0.0,
+            &mut o,
+        );
+        t.on(Event::Eou { at: 1.48, p: 0.45 }, 1.48, 0.0, &mut o);
+        assert_eq!(
+            events(&o[2..]),
+            vec![
+                ("EagerEndOfTurn", 0, "сервер упал"),
+                ("TurnResumed", 0, "сервер упал..."),
+                ("EagerEndOfTurn", 0, "сервер упал...")
+            ]
         );
     }
 

@@ -45,6 +45,7 @@ struct Params {
     hints: Vec<String>, // as the client sent them; empty when `langs` is the default
     thr: f32,
     timeout_ms: u32,
+    eager: Option<f32>,
 }
 
 fn env(k: &str, d: &str) -> String {
@@ -206,8 +207,8 @@ fn listen(cfg: Arc<Cfg>, mut s: TcpStream, req: &Req, rest: Vec<u8>) {
 }
 
 fn params(cfg: &Cfg, req: &Req) -> Result<Params, String> {
-    let (mut enc, mut rate, mut langs, mut thr, mut timeout_ms) =
-        (None, None, vec![], 0.7f32, 5000u32);
+    let (mut enc, mut rate, mut langs, mut thr, mut timeout_ms, mut eager) =
+        (None, None, vec![], 0.7f32, 5000u32, None);
     let mine = cfg.models.langs();
     for (k, v) in &req.query {
         match k.as_str() {
@@ -247,6 +248,14 @@ fn params(cfg: &Cfg, req: &Req) -> Result<Params, String> {
                     .filter(|t| (100..=60000).contains(t))
                     .ok_or("eot_timeout_ms must be an integer from 100 to 60000.")?
             }
+            "eager_eot_threshold" => {
+                eager = Some(
+                    v.parse()
+                        .ok()
+                        .filter(|t| (0.3..=0.9).contains(t))
+                        .ok_or("eager_eot_threshold must be a number from 0.3 to 0.9.")?,
+                )
+            }
             _ => {} // model, keyterm, numerals and the rest: accepted and ignored
         }
     }
@@ -255,6 +264,9 @@ fn params(cfg: &Cfg, req: &Req) -> Result<Params, String> {
     }
     if rate.is_some_and(|r| r != "16000") {
         return Err("Only sample_rate=16000 is supported.".into());
+    }
+    if eager.is_some_and(|e| e > thr) {
+        return Err("eager_eot_threshold must not be greater than eot_threshold.".into());
     }
     let hints = langs.clone();
     if langs.is_empty() {
@@ -265,6 +277,7 @@ fn params(cfg: &Cfg, req: &Req) -> Result<Params, String> {
         hints,
         thr,
         timeout_ms,
+        eager,
     })
 }
 
@@ -449,6 +462,7 @@ fn work(
         },
     );
     let mut t = Turns::new(p.thr, p.timeout_ms, s.lang());
+    t.eager = p.eager;
     let (mut lib, mut out) = (0usize, vec![]);
     let mut recent: VecDeque<f32> = VecDeque::new(); // the last LID_KEEP library samples, only with tinylid on
     let mut stall = std::env::var("TINYASR_TEST_STALL_MS") // tests only: one sleep after 1 s of audio
