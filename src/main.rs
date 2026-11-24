@@ -17,8 +17,9 @@ use tungstenite::{Error as WsError, Message, WebSocket};
 use turns::{Msg, Turns, list, q};
 
 const SR: usize = 16000;
-/// An `Update` goes out when nothing else did for this long (clients read the steady stream as liveness).
-const HEARTBEAT: Duration = Duration::from_millis(200);
+/// An `Update` goes out when the worker processed this much audio (0.2 s) since the last message: as Flux, by audio,
+/// so a stalled decoder goes quiet. 0.2 s, not Flux's ~0.25 s: with 40 ms frames that would leave 280 ms gaps.
+const HEARTBEAT: u64 = SR as u64 / 5;
 /// Socket read timeout: how often the socket thread looks at outgoing messages.
 const POLL: Duration = Duration::from_millis(10);
 /// Recent audio kept for tinylid (it reads at most 30 s).
@@ -310,7 +311,7 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
         lang: String::new(),
         silence: None,
     };
-    let mut last = Instant::now();
+    let mut beat = 0u64; // pos when the last message went out
     // (lag, dropped) in ms, and pos
     let stamp = || {
         let ((got, dropped), p) = (audio.stats(), pos.load(Ordering::Relaxed));
@@ -345,7 +346,7 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
             loop {
                 match rx.try_recv() {
                     Ok(m) => {
-                        let (lag, dropped, _) = stamp();
+                        let (lag, dropped, p) = stamp();
                         let j = m.json(rid, &hinted, seq, lag, dropped);
                         if cfg.trace {
                             sent[0].fetch_add(1, Ordering::Relaxed);
@@ -354,7 +355,7 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
                         ok &= ws.send(Message::text(j)).is_ok();
                         seq += 1;
                         hb = m.heartbeat();
-                        last = Instant::now();
+                        beat = p;
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
@@ -391,8 +392,8 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
                     }
                 }
             }
-            if closing.is_none() && ok && last.elapsed() >= HEARTBEAT {
-                let (lag, dropped, p) = stamp();
+            let (lag, dropped, p) = stamp();
+            if closing.is_none() && ok && p >= beat + HEARTBEAT {
                 hb.end = p as f64 / SR as f64;
                 let j = hb.json(rid, &hinted, seq, lag, dropped);
                 if cfg.trace {
@@ -401,7 +402,7 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
                 }
                 ok &= ws.send(Message::text(j)).is_ok();
                 seq += 1;
-                last = Instant::now();
+                beat = p;
             }
         }
         if ok && ws.flush().is_err() && closing.is_none() {
@@ -450,6 +451,10 @@ fn work(
     let mut t = Turns::new(p.thr, p.timeout_ms, s.lang());
     let (mut lib, mut out) = (0usize, vec![]);
     let mut recent: VecDeque<f32> = VecDeque::new(); // the last LID_KEEP library samples, only with tinylid on
+    let mut stall = std::env::var("TINYASR_TEST_STALL_MS") // tests only: one sleep after 1 s of audio
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis);
     // trace: push count, push time sum and max this second; open sentence words and its start (library samples); turn chars
     let (t0, mut tlog) = (Instant::now(), Instant::now());
     let (mut pn, mut psum, mut pmax) = (0u32, Duration::ZERO, Duration::ZERO);
@@ -458,6 +463,9 @@ fn work(
         let (evs, off, fin) = match audio.pop() {
             Pop::Audio(c, off) => {
                 lib += c.len();
+                if let Some(d) = stall.take_if(|_| lib >= SR) {
+                    std::thread::sleep(d);
+                }
                 if cfg.lid.is_some() {
                     recent.extend(&c);
                     recent.drain(..recent.len().saturating_sub(LID_KEEP));

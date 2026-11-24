@@ -173,12 +173,22 @@ impl Log {
             .collect()
     }
 
-    fn max_gap(&self) -> Duration {
-        self.msgs
+    /// Over the `TurnInfo` messages before `to`: the longest wall-clock gap and the largest step of `audio_window_end`.
+    fn gaps(&self, to: usize) -> (Duration, f64) {
+        let m = &self.msgs[1..to];
+        let wall = m
             .windows(2)
             .map(|w| w[1].0 - w[0].0)
             .max()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let audio = m
+            .windows(2)
+            .map(|w| {
+                w[1].1["audio_window_end"].as_f64().unwrap()
+                    - w[0].1["audio_window_end"].as_f64().unwrap()
+            })
+            .fold(0.0, f64::max);
+        (wall, audio)
     }
 }
 
@@ -245,7 +255,11 @@ fn turns_heartbeats_and_close() {
     log.stream(&mut ws, &vec![0u8; 32000]);
     log.stream(&mut ws, &noise(1.0));
     let silence_from = log.msgs.len();
+    // no audio, no messages (as Flux): 0.5 s for the worker to finish the queued audio, then 1 s without a message
+    log.read(&mut ws, Instant::now() + Duration::from_millis(500));
+    let quiet_from = log.msgs.len();
     log.read(&mut ws, Instant::now() + Duration::from_secs(1));
+    let quiet = log.msgs.len() - quiet_from;
     log.close(&mut ws);
 
     assert_eq!(log.msgs[0].1["type"], "Connected");
@@ -312,10 +326,11 @@ fn turns_heartbeats_and_close() {
         assert!(m["silence_ms"].as_u64().is_some_and(|s| s >= 240), "{m}");
     }
 
-    // heartbeats: never 250 ms without a message, in speech, in silence and in noise
-    let gap = log.max_gap();
-    assert!(gap <= Duration::from_millis(250), "max gap {gap:?}");
-    assert!(log.msgs.len() > silence_from + 3);
+    // heartbeats while audio streams, in speech, in silence and in noise: one per 0.2 s of processed audio.
+    // The audio step is printed, not checked: after a decode the worker catches up between two polls (up to 0.56 s).
+    let (gap, step) = log.gaps(silence_from);
+    assert!(gap <= Duration::from_secs(1), "max gap {gap:?}");
+    assert_eq!(quiet, 0, "messages without audio");
     // 1 s of silence and 1 s of noise: the Updates go on, with the same (empty) next turn
     let idle = &log.msgs[idle_from..silence_from];
     assert!(
@@ -328,10 +343,31 @@ fn turns_heartbeats_and_close() {
     );
     assert!(log.closed, "no close frame");
     eprintln!(
-        "turn latency after speech end: {:?}; max message gap {gap:?}; {} messages",
+        "turn latency after speech end: {:?}; max message gap {gap:?}, max audio step {step:.2} s; {} messages",
         lat,
         log.msgs.len()
     );
+}
+
+#[test]
+fn stalled_worker_goes_quiet() {
+    let srv = start(&[("TINYASR_TEST_STALL_MS", "1500")]); // the worker sleeps 1.5 s after 1 s of audio
+    let mut ws = connect(srv.port, Q, None).unwrap();
+    let mut log = Log::default();
+    log.stream(&mut ws, &vec![0u8; 4 * 32000]);
+    let (gap, i) = log
+        .msgs
+        .windows(2)
+        .enumerate()
+        .map(|(i, w)| (w[1].0 - w[0].0, i + 1))
+        .max()
+        .unwrap();
+    assert!(gap >= Duration::from_millis(1200), "max gap {gap:?}");
+    assert!(log.msgs.len() > i + 3, "messages did not resume");
+    let lag = log.msgs[i].1["lag_ms"].as_u64().unwrap();
+    assert!(lag >= 500, "lag after the stall {lag} ms");
+    log.close(&mut ws);
+    eprintln!("stall: gap {gap:?}, lag after it {lag} ms");
 }
 
 #[test]
@@ -407,7 +443,7 @@ fn concurrent_sessions() {
     assert_eq!(get(srv.port, "/v2/listen?encoding=linear16").0, 426);
     let clip = clip();
     let port = srv.port;
-    let res: Vec<(Duration, Duration)> = std::thread::scope(|s| {
+    let res: Vec<(Duration, (Duration, f64))> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..n)
             .map(|k| {
                 let clip = &clip;
@@ -416,8 +452,9 @@ fn concurrent_sessions() {
                     let mut ws = connect(port, Q, None).unwrap();
                     let mut log = Log::default();
                     log.turn(&mut ws, clip, 4.0);
+                    let to = log.msgs.len();
                     log.close(&mut ws);
-                    (check_turn(&log, 0), log.max_gap())
+                    (check_turn(&log, 0), log.gaps(to))
                 })
             })
             .collect();
@@ -425,11 +462,12 @@ fn concurrent_sessions() {
     });
     let lat_max = res.iter().map(|r| r.0).max().unwrap();
     let lat_mean = res.iter().map(|r| r.0).sum::<Duration>() / n as u32;
-    let gap = res.iter().map(|r| r.1).max().unwrap();
+    let gap = res.iter().map(|r| r.1.0).max().unwrap();
+    let step = res.iter().map(|r| r.1.1).fold(0.0, f64::max);
     eprintln!(
-        "concurrent n={n}: end-of-turn after speech end mean {lat_mean:?} max {lat_max:?}; max message gap {gap:?}"
+        "concurrent n={n}: end-of-turn after speech end mean {lat_mean:?} max {lat_max:?}; max message gap {gap:?}, max audio step {step:.2} s"
     );
-    assert!(gap <= Duration::from_millis(250), "max gap {gap:?}");
+    assert!(gap <= Duration::from_secs(1), "max gap {gap:?}");
 }
 
 #[test]
