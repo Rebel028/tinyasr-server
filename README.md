@@ -136,6 +136,7 @@ All times are seconds of the client's audio stream, dropped audio included.
 | `TINYASR_MAX_SESSIONS` | CPU count | Concurrent sessions. The next upgrade gets a 503. |
 | `TINYASR_LID` | unset | Path of `tinylid.bin`, normally `/models/tinylid.bin` (inside the full image; the slim image fetches it). If set, `languages` of each `EndOfTurn` comes from tinylid, which adds about 90 ms to the end of turn. Unset, the model is not loaded. |
 | `TINYASR_QUEUE_MS` | `3000` | Audio queue per session. When it overflows, the oldest audio is dropped. |
+| `TINYASR_TRACE` | unset | `1`: one `trace` log line per second per session: `t_s`, `push_n`, `push_ms`, `push_max_ms` (time in the library this second), `proc_s`, `recv_s`, `queue_s`, `dropped_s` (audio processed, received, queued, dropped), `open_words`, `open_s` (the open sentence), `turn_chars`, `msgs`, `msg_bytes` (sent this second), `rss_mb`. |
 
 The log goes to stderr. There is one line per session start (peer, request id, languages, thresholds) and one per session end (reason, duration, audio seconds, dropped seconds, turns). Transcripts are never logged.
 

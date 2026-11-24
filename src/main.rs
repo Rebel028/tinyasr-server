@@ -34,6 +34,7 @@ struct Cfg {
     token: Option<String>,
     max: usize,
     queue: usize, // samples
+    trace: bool,  // TINYASR_TRACE=1: one timing line per second per session
     active: AtomicUsize,
     ids: AtomicU64,
 }
@@ -101,6 +102,7 @@ fn main() {
             .filter(|t| !t.is_empty()),
         max: num("TINYASR_MAX_SESSIONS", cores),
         queue: num("TINYASR_QUEUE_MS", 3000usize) * SR / 1000,
+        trace: env("TINYASR_TRACE", "0") == "1",
         active: AtomicUsize::new(0),
         ids: AtomicU64::new(1),
         models,
@@ -280,12 +282,13 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
     let mut ws = WebSocket::from_partially_read(s, rest, Role::Server, None);
     let audio = Arc::new(Audio::new(cfg.queue));
     let pos = Arc::new(AtomicU64::new(0)); // stream samples the worker has processed
+    let sent = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]); // messages, bytes; counted only with trace on
     let (tx, rx) = mpsc::channel::<Msg>();
     let worker = {
-        let (cfg, audio, pos) = (cfg.clone(), audio.clone(), pos.clone());
+        let (cfg, audio, pos, sent) = (cfg.clone(), audio.clone(), pos.clone(), sent.clone());
         std::thread::Builder::new()
             .name(format!("session-{id}"))
-            .spawn(move || work(&cfg, &p, &audio, &pos, &tx))
+            .spawn(move || work(&cfg, &p, &audio, &pos, &tx, &sent))
     };
     let Ok(worker) = worker else { return };
     let mut worker = Some(worker);
@@ -335,7 +338,12 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
             loop {
                 match rx.try_recv() {
                     Ok(m) => {
-                        ok &= ws.send(Message::text(m.json(rid, &hinted, seq))).is_ok();
+                        let j = m.json(rid, &hinted, seq);
+                        if cfg.trace {
+                            sent[0].fetch_add(1, Ordering::Relaxed);
+                            sent[1].fetch_add(j.len() as u64, Ordering::Relaxed);
+                        }
+                        ok &= ws.send(Message::text(j)).is_ok();
                         seq += 1;
                         hb = m.heartbeat();
                         last = Instant::now();
@@ -377,7 +385,12 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
             }
             if closing.is_none() && ok && last.elapsed() >= HEARTBEAT {
                 hb.end = pos.load(Ordering::Relaxed) as f64 / SR as f64;
-                ok &= ws.send(Message::text(hb.json(rid, &hinted, seq))).is_ok();
+                let j = hb.json(rid, &hinted, seq);
+                if cfg.trace {
+                    sent[0].fetch_add(1, Ordering::Relaxed);
+                    sent[1].fetch_add(j.len() as u64, Ordering::Relaxed);
+                }
+                ok &= ws.send(Message::text(j)).is_ok();
                 seq += 1;
                 last = Instant::now();
             }
@@ -408,7 +421,14 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
 }
 
 /// The session worker: audio from the queue into the library, turn messages out. Returns the number of turns ended.
-fn work(cfg: &Cfg, p: &Params, audio: &Audio, pos: &AtomicU64, tx: &mpsc::Sender<Msg>) -> u32 {
+fn work(
+    cfg: &Cfg,
+    p: &Params,
+    audio: &Audio,
+    pos: &AtomicU64,
+    tx: &mpsc::Sender<Msg>,
+    sent: &[AtomicU64; 2],
+) -> u32 {
     let codes: Vec<&str> = p.langs.iter().map(String::as_str).collect();
     let mut s = tinyasr::Session::new(
         &cfg.models,
@@ -421,6 +441,10 @@ fn work(cfg: &Cfg, p: &Params, audio: &Audio, pos: &AtomicU64, tx: &mpsc::Sender
     let mut t = Turns::new(p.thr, p.timeout_ms, s.lang());
     let (mut lib, mut out) = (0usize, vec![]);
     let mut recent: VecDeque<f32> = VecDeque::new(); // the last LID_KEEP library samples, only with tinylid on
+    // trace: push count, push time sum and max this second; open sentence words and its start (library samples); turn chars
+    let (t0, mut tlog) = (Instant::now(), Instant::now());
+    let (mut pn, mut psum, mut pmax) = (0u32, Duration::ZERO, Duration::ZERO);
+    let (mut open_w, mut open_at, mut turn_c) = (0usize, 0usize, 0usize);
     loop {
         let (evs, off, fin) = match audio.pop() {
             Pop::Audio(c, off) => {
@@ -429,13 +453,26 @@ fn work(cfg: &Cfg, p: &Params, audio: &Audio, pos: &AtomicU64, tx: &mpsc::Sender
                     recent.extend(&c);
                     recent.drain(..recent.len().saturating_sub(LID_KEEP));
                 }
-                (s.push(&c), off, false)
+                let t1 = cfg.trace.then(Instant::now);
+                let evs = s.push(&c);
+                if let Some(t1) = t1 {
+                    let d = t1.elapsed();
+                    (pn, psum, pmax) = (pn + 1, psum + d, pmax.max(d));
+                }
+                (evs, off, false)
             }
             Pop::Finish(off) => (s.finish(), off, true),
             Pop::Abort => return t.count(),
         };
         let (ps, os) = (lib as f64 / SR as f64, off as f64 / SR as f64);
         for e in evs {
+            if cfg.trace {
+                match &e {
+                    tinyasr::Event::Partial { open, tail } => open_w = open.len() + tail.len(),
+                    tinyasr::Event::Commit(_) => (open_w, open_at) = (0, lib),
+                    _ => {}
+                }
+            }
             t.on(e, ps, os, &mut out);
         }
         if fin {
@@ -453,6 +490,45 @@ fn work(cfg: &Cfg, p: &Params, audio: &Audio, pos: &AtomicU64, tx: &mpsc::Sender
                 if let Some((code, _)) = lid.top(&lid.predict(&x, tinylid::Mode::Fast), 1).first() {
                     m.lang = code.to_string();
                 }
+            }
+        }
+        if cfg.trace {
+            if let Some(m) = out.last() {
+                turn_c = if m.event == "EndOfTurn" {
+                    0
+                } else {
+                    m.transcript.chars().count()
+                };
+            }
+            if tlog.elapsed() >= Duration::from_secs(1) {
+                let (recv, queued, dropped) = {
+                    let q = audio.lock();
+                    (q.received, q.len, q.dropped)
+                };
+                // statm field 2: resident pages; 4 KiB pages assumed
+                let rss = std::fs::read_to_string("/proc/self/statm")
+                    .ok()
+                    .and_then(|m| m.split_whitespace().nth(1)?.parse::<u64>().ok())
+                    .map_or(-1.0, |p| (p * 4096) as f64 / 1048576.0);
+                let secs = |v: usize| v as f64 / SR as f64;
+                eprintln!(
+                    "{} trace t_s={:.1} push_n={pn} push_ms={:.1} push_max_ms={:.1} proc_s={:.2} recv_s={:.2} queue_s={:.2} dropped_s={:.2} open_words={open_w} open_s={:.2} turn_chars={turn_c} msgs={} msg_bytes={} rss_mb={rss:.1}",
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("session-?")
+                        .replace('-', " "),
+                    t0.elapsed().as_secs_f64(),
+                    psum.as_secs_f64() * 1e3,
+                    pmax.as_secs_f64() * 1e3,
+                    (lib as u64 + off) as f64 / SR as f64,
+                    recv as f64 / SR as f64,
+                    secs(queued),
+                    dropped as f64 / SR as f64,
+                    secs(lib - open_at),
+                    sent[0].swap(0, Ordering::Relaxed),
+                    sent[1].swap(0, Ordering::Relaxed),
+                );
+                (tlog, pn, psum, pmax) = (Instant::now(), 0, Duration::ZERO, Duration::ZERO);
             }
         }
         for m in out.drain(..) {
