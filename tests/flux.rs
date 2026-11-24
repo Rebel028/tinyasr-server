@@ -182,6 +182,17 @@ impl Log {
     }
 }
 
+/// White noise at about -35 dBFS from a fixed generator: audio without speech, the same in every run.
+fn noise(secs: f64) -> Vec<u8> {
+    let mut x = 1u32;
+    (0..(secs * 16000.0) as usize)
+        .flat_map(|_| {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((x >> 16) as u16 as i16 / 32).to_le_bytes()
+        })
+        .collect()
+}
+
 fn clip() -> Vec<u8> {
     std::fs::read("tests/data/ru5.s16").expect("tests/data/ru5.s16")
 }
@@ -230,6 +241,9 @@ fn turns_heartbeats_and_close() {
     let mut log = Log::default();
     log.turn(&mut ws, &clip, 4.0);
     log.turn(&mut ws, &clip, 4.0);
+    let idle_from = log.msgs.len();
+    log.stream(&mut ws, &vec![0u8; 32000]);
+    log.stream(&mut ws, &noise(1.0));
     let silence_from = log.msgs.len();
     log.read(&mut ws, Instant::now() + Duration::from_secs(1));
     log.close(&mut ws);
@@ -282,7 +296,9 @@ fn turns_heartbeats_and_close() {
         assert!(
             w["sequence_id"].is_u64()
                 && w["audio_window_end"].is_f64()
-                && w["end_of_turn_confidence"].is_f64(),
+                && w["end_of_turn_confidence"].is_f64()
+                && w["lag_ms"].is_u64()
+                && w["dropped_ms"] == 0,
             "{w}"
         );
     }
@@ -292,10 +308,24 @@ fn turns_heartbeats_and_close() {
             .all(|w| w[1].1["sequence_id"].as_u64() > w[0].1["sequence_id"].as_u64())
     );
 
-    // heartbeats: never 250 ms without a message, in speech or in silence
+    for (_, m) in log.turns("EndOfTurn") {
+        assert!(m["silence_ms"].as_u64().is_some_and(|s| s >= 240), "{m}");
+    }
+
+    // heartbeats: never 250 ms without a message, in speech, in silence and in noise
     let gap = log.max_gap();
     assert!(gap <= Duration::from_millis(250), "max gap {gap:?}");
     assert!(log.msgs.len() > silence_from + 3);
+    // 1 s of silence and 1 s of noise: the Updates go on, with the same (empty) next turn
+    let idle = &log.msgs[idle_from..silence_from];
+    assert!(
+        idle.len() >= 8
+            && idle.iter().all(|m| m.1["event"] == "Update"
+                && m.1["turn_index"] == 2
+                && text(&m.1).is_empty()),
+        "silence and noise: {:?}",
+        idle.iter().map(|m| &m.1).collect::<Vec<_>>()
+    );
     assert!(log.closed, "no close frame");
     eprintln!(
         "turn latency after speech end: {:?}; max message gap {gap:?}; {} messages",

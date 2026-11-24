@@ -308,8 +308,15 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
         conf: 0.0,
         trigger: None,
         lang: String::new(),
+        silence: None,
     };
     let mut last = Instant::now();
+    // (lag, dropped) in ms, and pos
+    let stamp = || {
+        let ((got, dropped), p) = (audio.stats(), pos.load(Ordering::Relaxed));
+        let ms = |v: u64| v * 1000 / SR as u64;
+        (ms(got.saturating_sub(p)), ms(dropped), p)
+    };
     let mut odd = None;
     let mut closing: Option<Instant> = None;
     while ok {
@@ -338,7 +345,8 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
             loop {
                 match rx.try_recv() {
                     Ok(m) => {
-                        let j = m.json(rid, &hinted, seq);
+                        let (lag, dropped, _) = stamp();
+                        let j = m.json(rid, &hinted, seq, lag, dropped);
                         if cfg.trace {
                             sent[0].fetch_add(1, Ordering::Relaxed);
                             sent[1].fetch_add(j.len() as u64, Ordering::Relaxed);
@@ -384,8 +392,9 @@ fn session(cfg: &Arc<Cfg>, s: TcpStream, rest: Vec<u8>, p: Params, rid: &str, pe
                 }
             }
             if closing.is_none() && ok && last.elapsed() >= HEARTBEAT {
-                hb.end = pos.load(Ordering::Relaxed) as f64 / SR as f64;
-                let j = hb.json(rid, &hinted, seq);
+                let (lag, dropped, p) = stamp();
+                hb.end = p as f64 / SR as f64;
+                let j = hb.json(rid, &hinted, seq, lag, dropped);
                 if cfg.trace {
                     sent[0].fetch_add(1, Ordering::Relaxed);
                     sent[1].fetch_add(j.len() as u64, Ordering::Relaxed);

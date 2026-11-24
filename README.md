@@ -87,10 +87,10 @@ At connect:
 Then `TurnInfo` messages (values illustrative):
 
 ```json
-{"type":"TurnInfo","request_id":"…","sequence_id":12,"event":"StartOfTurn","turn_index":0,"audio_window_start":0.32,"audio_window_end":1.28,"transcript":"сервер","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.000}
-{"type":"TurnInfo","request_id":"…","sequence_id":13,"event":"Update","turn_index":0,"audio_window_start":0.32,"audio_window_end":1.28,"transcript":"сервер","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.000}
-{"type":"TurnInfo","request_id":"…","sequence_id":30,"event":"EndOfTurn","turn_index":0,"audio_window_start":0.32,"audio_window_end":4.36,"transcript":"Сервер базы данных упал после обновления платежей.","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.712,"trigger":"model"}
-{"type":"TurnInfo","request_id":"…","sequence_id":31,"event":"Update","turn_index":1,"audio_window_start":4.36,"audio_window_end":4.52,"transcript":"","words":[],"languages":[],"languages_hinted":["ru"],"end_of_turn_confidence":0.000}
+{"type":"TurnInfo","request_id":"…","sequence_id":12,"event":"StartOfTurn","turn_index":0,"audio_window_start":0.32,"audio_window_end":1.28,"transcript":"сервер","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.000,"lag_ms":40,"dropped_ms":0}
+{"type":"TurnInfo","request_id":"…","sequence_id":13,"event":"Update","turn_index":0,"audio_window_start":0.32,"audio_window_end":1.28,"transcript":"сервер","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.000,"lag_ms":40,"dropped_ms":0}
+{"type":"TurnInfo","request_id":"…","sequence_id":30,"event":"EndOfTurn","turn_index":0,"audio_window_start":0.32,"audio_window_end":4.36,"transcript":"Сервер базы данных упал после обновления платежей.","words":[],"languages":["ru"],"languages_hinted":["ru"],"end_of_turn_confidence":0.712,"trigger":"model","silence_ms":480,"lag_ms":120,"dropped_ms":0}
+{"type":"TurnInfo","request_id":"…","sequence_id":31,"event":"Update","turn_index":1,"audio_window_start":4.36,"audio_window_end":4.52,"transcript":"","words":[],"languages":[],"languages_hinted":["ru"],"end_of_turn_confidence":0.000,"lag_ms":0,"dropped_ms":0}
 ```
 
 - `StartOfTurn`: the first recognized word of a turn.
@@ -98,13 +98,16 @@ Then `TurnInfo` messages (values illustrative):
 - `EndOfTurn`: the final transcript of the turn. `turn_index` goes up by one per turn.
 - `languages`: the language of the turn, one code. It is the language the recognizer is decoding in, or with `TINYASR_LID` on, the language tinylid hears in the `EndOfTurn`. It is `[]` while the transcript is empty.
 - `languages_hinted`: the `language_hint` codes of the session, as the server maps them (`ru-RU` becomes `ru`). It is `[]` when the client sent no hint and the server uses `TINYASR_LANGS`.
-- Heartbeat: when no other message went out for 200 ms, the server repeats the current state as an `Update`. This also happens in silence, where the transcript is empty and `turn_index` is the next turn. Clients can use the steady stream as a liveness signal.
+- Heartbeat: when no other message went out for 200 ms, the server repeats the current state as an `Update`. This also happens in silence, where the transcript is empty and `turn_index` is the next turn. Clients can use the steady stream as a liveness signal. It runs on wall time, so it goes on while the recognizer stalls: watch `lag_ms` for that.
+- `lag_ms` (every `TurnInfo`, this server's own): audio received minus audio processed when the message went out. It grows when the recognizer falls behind.
+- `dropped_ms` (every `TurnInfo`, this server's own): audio the queue has dropped in this session so far (see `TINYASR_QUEUE_MS`).
+- `silence_ms` (`EndOfTurn` only, this server's own): the silence since the pause began, when the library reported the pause. It is absent when the model has no end-of-turn head or the turn ended during speech.
 - If a session fails inside (a panic), the server sends `{"type":"Error","sequence_id":n,"code":"INTERNAL_SERVER_ERROR","description":"…"}` and closes with 1011. Other sessions keep running.
 
 End of turn:
 
 1. Model: the library's end-of-turn head says `p >= eot_threshold` at a pause, and the library then closes that sentence. The trigger is `model`.
-2. Timeout: no new word for `eot_timeout_ms` of audio after the last word of the turn. The trigger is `timeout`.
+2. Timeout: `eot_timeout_ms` of silence, as in Flux (the longest silence before a forced end of turn; new speech resets the timer). The silence starts where the library reports a pause began (its end-of-turn head runs at 0.24 s into it), and a word newer than the pause clears it. Speech that resumes without a recognized word does not clear it until the next pause replaces it. With a model that has no end-of-turn head, the timeout counts from the end of the newest word instead, and a session counts as such until its first pause. The trigger is `timeout`.
 3. `CloseStream` with a turn still open. The trigger is `manual`.
 
 All times are seconds of the client's audio stream, dropped audio included.
@@ -187,6 +190,8 @@ Measured on an i9-10900KF (10 cores, WSL2) with beam 4 and the Russian 5 s clip 
 | 8 | 0.76 / 0.80 s | 220 ms | 0 |
 | 16 | 1.05 / 1.34 s | 220 ms | 0 |
 | 24 | 2.33 / 2.95 s | 240 ms | 0 |
+
+Capacity on a small machine: measured with a 2-core limit on real-time long takes, the decoder lag starts to grow above 2 parallel sessions (above 1 session on 1 core), with beam 4 and with beam 1. Beam 1 (`TINYASR_BEAM=1`) roughly halves the time to the first partial, at an accuracy cost: it is cheaper and can lose punctuation, and the tinyasr README gives Russian FLEURS WER 5.47 % for the beam 4 second pass against 7.22 % for the greedy streaming pass. Accuracy at beam 1 was not measured here.
 
 ## Releases
 
