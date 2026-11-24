@@ -26,7 +26,15 @@ impl Drop for Server {
     }
 }
 
+/// A server that passed its self-test.
 fn start(envs: &[(&str, &str)]) -> Server {
+    let s = listening(envs);
+    assert_eq!(get(s.port, "/health"), (200, "{\"status\":\"ok\"}".into()));
+    s
+}
+
+/// A server that answers HTTP; it binds only after its self-test.
+fn listening(envs: &[(&str, &str)]) -> Server {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -41,7 +49,7 @@ fn start(envs: &[(&str, &str)]) -> Server {
         .unwrap();
     let s = Server { child, port };
     let t = Instant::now();
-    while get(port, "/health").0 != 200 {
+    while get(port, "/health").0 == 0 {
         assert!(
             t.elapsed() < Duration::from_secs(30),
             "server did not start"
@@ -415,6 +423,14 @@ fn eager_end_of_turn() {
             .filter(|e| *e != "Update")
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn failed_self_test_gives_503() {
+    let srv = listening(&[("TINYASR_TEST_SELFTEST_TEXT", "другой текст")]);
+    let (code, body) = get(srv.port, "/health");
+    assert_eq!(code, 503, "{body}");
+    assert!(body.contains("self-test failed"), "{body}");
 }
 
 #[test]

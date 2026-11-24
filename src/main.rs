@@ -26,6 +26,9 @@ const POLL: Duration = Duration::from_millis(10);
 const LID_KEEP: usize = 30 * SR;
 /// The start of a turn given to tinylid: it costs ~30 ms per second of audio (i9-10900KF), so 3 s keep it under 100 ms.
 const LID_MAX: usize = 3 * SR;
+/// The start-up self-test clip (5 s of Russian, the integration tests' clip) and its text.
+const CLIP: &[u8] = include_bytes!("../tests/data/ru5.s16");
+const CLIP_TEXT: &str = "сервер базы данных упал после обновления платежей";
 
 struct Cfg {
     models: tinyasr::Models,
@@ -34,8 +37,9 @@ struct Cfg {
     beam: usize,
     token: Option<String>,
     max: usize,
-    queue: usize, // samples
-    trace: bool,  // TINYASR_TRACE=1: one timing line per second per session
+    queue: usize,               // samples
+    trace: bool,                // TINYASR_TRACE=1: one timing line per second per session
+    health: Result<(), String>, // the start-up self-test; Err holds the reason
     active: AtomicUsize,
     ids: AtomicU64,
 }
@@ -95,7 +99,7 @@ fn main() {
             models.langs()
         );
     }
-    let cfg = Arc::new(Cfg {
+    let mut cfg = Cfg {
         lid,
         langs,
         beam: num("TINYASR_BEAM", tinyasr::DEFAULT_BEAM),
@@ -105,16 +109,21 @@ fn main() {
         max: num("TINYASR_MAX_SESSIONS", cores),
         queue: num("TINYASR_QUEUE_MS", 3000usize) * SR / 1000,
         trace: env("TINYASR_TRACE", "0") == "1",
+        health: Ok(()),
         active: AtomicUsize::new(0),
         ids: AtomicU64::new(1),
         models,
-    });
+    };
+    let loaded = t0.elapsed();
+    // before the bind: /health cannot answer before the result is known
+    cfg.health = self_test(&cfg);
+    let cfg = Arc::new(cfg);
     let port = env("PORT", "8000");
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).expect("bind PORT");
     eprintln!(
         "tinyasr-server {} listening on :{port}, models loaded in {} ms, model langs {:?}, default langs {:?}, beam {}, max sessions {}, queue {} ms, auth {}, lid {}",
         env!("CARGO_PKG_VERSION"),
-        t0.elapsed().as_millis(),
+        loaded.as_millis(),
         cfg.models.langs(),
         cfg.langs,
         cfg.beam,
@@ -139,7 +148,14 @@ fn conn(cfg: Arc<Cfg>, mut s: TcpStream) {
         return err(&mut s, 400, "BAD_REQUEST", "Malformed request.");
     };
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/health") => http(&mut s, 200, "{\"status\":\"ok\"}"),
+        ("GET", "/health") => match &cfg.health {
+            Ok(()) => http(&mut s, 200, "{\"status\":\"ok\"}"),
+            Err(r) => http(
+                &mut s,
+                503,
+                &format!("{{\"status\":\"self-test failed\",\"reason\":{}}}", q(r)),
+            ),
+        },
         ("GET", "/v2/listen") => listen(cfg, s, &req, rest),
         _ => err(&mut s, 404, "NOT_FOUND", "Not found."),
     }
@@ -571,6 +587,78 @@ fn work(
             return t.count();
         }
     }
+}
+
+/// The bundled clip once through a session worker, in 40 ms frames as a client sends it. Logs the result.
+fn self_test(cfg: &Cfg) -> Result<(), String> {
+    // shortcut: the clip is Russian, so a model without ru only proves that the decode runs; add a clip per language when those models need a text check.
+    let ru = cfg.models.langs().contains(&"ru");
+    let p = Params {
+        langs: if ru {
+            vec!["ru".into()]
+        } else {
+            cfg.langs.clone()
+        },
+        hints: vec![],
+        thr: 0.7,
+        timeout_ms: 5000,
+        eager: None,
+    };
+    let audio = Audio::new(usize::MAX);
+    for f in CLIP.chunks(1280) {
+        audio.push(pcm(f, &mut None));
+    }
+    audio.set(State::Finish);
+    let (tx, rx) = mpsc::channel();
+    let t0 = Instant::now();
+    let done = std::thread::scope(|s| {
+        s.spawn(|| {
+            work(
+                cfg,
+                &p,
+                &audio,
+                &AtomicU64::new(0),
+                &tx,
+                &Default::default(),
+            )
+        })
+        .join()
+    });
+    let ms = t0.elapsed().as_millis();
+    let got = rx
+        .try_iter()
+        .filter(|m| m.event == "EndOfTurn")
+        .map(|m| m.transcript)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let want = env("TINYASR_TEST_SELFTEST_TEXT", CLIP_TEXT); // tests only: a wrong text fails the self-test
+    let r = match done {
+        Err(_) => Err("the decode failed".to_string()),
+        Ok(_) if !ru => {
+            eprintln!(
+                "self-test: transcript check skipped, the model has no ru for the Russian clip"
+            );
+            Ok(())
+        }
+        Ok(_) if words(&got) == words(&want) => Ok(()),
+        Ok(_) => Err(format!("transcript {got:?}, expected {want:?}")),
+    };
+    eprintln!(
+        "self-test {} in {ms} ms, transcript {got:?}",
+        r.as_ref()
+            .map_or_else(|e| format!("FAILED ({e})"), |_| "ok".into())
+    );
+    r
+}
+
+/// Lowercase words without punctuation, ё as е: the comparison of tests/flux.rs.
+fn words(s: &str) -> Vec<String> {
+    s.to_lowercase()
+        .replace('ё', "е")
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq)]

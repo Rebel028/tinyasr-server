@@ -157,7 +157,18 @@ Alternative design, not implemented: the library could finish the sentence at 0.
 | `TINYASR_QUEUE_MS` | `3000` | Audio queue per session. When it overflows, the oldest audio is dropped. |
 | `TINYASR_TRACE` | unset | `1`: one `trace` log line per second per session: `t_s`, `push_n`, `push_ms`, `push_max_ms` (time in the library this second), `proc_s`, `recv_s`, `queue_s`, `dropped_s` (audio processed, received, queued, dropped), `open_words`, `open_s` (the open sentence), `turn_chars`, `msgs`, `msg_bytes` (sent this second), `rss_mb`. |
 
-The log goes to stderr. There is one line per session start (peer, request id, languages, thresholds) and one per session end (reason, duration, audio seconds, dropped seconds, turns). Transcripts are never logged.
+The log goes to stderr. There is one line per session start (peer, request id, languages, thresholds) and one per session end (reason, duration, audio seconds, dropped seconds, turns). Session transcripts are never logged.
+
+### Self-test and `/health`
+
+At start, after the models load and before the port opens, the server decodes a bundled 5 s Russian clip (`tests/data/ru5.s16`, embedded in the binary) once through the same session worker that serves clients. The start log gets one `self-test` line with the result, the decode time and the clip's transcript. The decode takes about 1.6 s on an i9-10900KF, so the port opens that much later.
+
+| `GET /health` | When |
+|---|---|
+| 200 `{"status":"ok"}` | The self-test passed. |
+| 503 `{"status":"self-test failed","reason":"…"}` | The decode failed, or the transcript differs from the clip's text. The server still serves sessions, so the failure shows in `/health` and in the log. |
+
+Model language rule: when the model has `ru`, the transcript must equal the clip's text, compared as lowercase words without punctuation (`ё` as `е`). When it has no `ru` (for example `en-es-it-pt`), the self-test checks only that the decode completes, logs that the transcript check was skipped, and `/health` is 200. A model or VAD file that cannot be read or loaded still stops the server at start.
 
 ## Build and run
 
@@ -199,13 +210,15 @@ docker run --rm -v tasr-cargo:/usr/local/cargo/registry -v tasr-cargo-git:/usr/l
 
 Measured on an i9-10900KF (10 cores, WSL2) with beam 4 and the Russian 5 s clip at real-time pace plus 4 s of silence:
 
-| Sessions | End of turn after end of speech, mean / max | Max gap between messages | Dropped audio |
-|---|---|---|---|
-| 1 | 0.78 to 0.87 s | 216 ms | 0 |
-| 4 | 0.75 / 0.80 s | 216 ms | 0 |
-| 8 | 0.76 / 0.80 s | 220 ms | 0 |
-| 16 | 1.05 / 1.34 s | 220 ms | 0 |
-| 24 | 2.33 / 2.95 s | 240 ms | 0 |
+| Sessions | End of turn after end of speech, mean / max | Dropped audio |
+|---|---|---|
+| 1 | 0.78 to 0.87 s | 0 |
+| 4 | 0.75 / 0.80 s | 0 |
+| 8 | 0.76 / 0.80 s | 0 |
+| 16 | 1.05 / 1.34 s | 0 |
+| 24 | 2.33 / 2.95 s | 0 |
+
+The heartbeat goes out per 0.2 s of processed audio, so the wall-clock gap between messages is 0.2 s plus the decode time, measured up to about 0.55 s in the test suite.
 
 Capacity on a small machine: measured with a 2-core limit on real-time long takes, the decoder lag starts to grow above 2 parallel sessions (above 1 session on 1 core), with beam 4 and with beam 1. Beam 1 (`TINYASR_BEAM=1`) roughly halves the time to the first partial, at an accuracy cost: it is cheaper and can lose punctuation, and the tinyasr README gives Russian FLEURS WER 5.47 % for the beam 4 second pass against 7.22 % for the greedy streaming pass. Accuracy at beam 1 was not measured here.
 
