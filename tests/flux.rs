@@ -625,7 +625,8 @@ fn input_formats() {
     let pcm = |s: &[i16]| s.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
     let at8 = resample(&clip, 1, 2);
     // encoding, rate, the clip as sent, bytes per 40 ms, 2 s of silence
-    let cases: Vec<(&str, usize, Vec<u8>, usize, Vec<u8>)> = vec![
+    type Case = (&'static str, usize, Vec<u8>, usize, Vec<u8>);
+    let cases: Vec<Case> = vec![
         ("linear16", 16000, clip.clone(), FRAME, vec![0; 64000]),
         ("linear16", 8000, pcm(&at8), 640, vec![0; 32000]),
         (
